@@ -1,0 +1,109 @@
+{
+  "name": "Tahdiri AI Generator V2",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "tahdiri-ai-generator",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [-800, 300],
+      "id": "webhook-node-001",
+      "webhookId": "38a00c12-19e2-4837-b7ce-5a508926fa01"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate and normalize incoming request\nconst body = $input.first().json.body || {};\n\nconst grade = (body.grade || '').toString().trim() || 'غير محدد';\nconst subject = (body.subject || '').toString().trim() || 'غير محدد';\nconst lessonTitle = (body.lessonTitle || '').toString().trim() || 'الدرس الحالي';\nconst availableStrategies = Array.isArray(body.availableStrategies) ? body.availableStrategies.filter(Boolean) : [];\nconst availableTools = Array.isArray(body.availableTools) ? body.availableTools.filter(Boolean) : [];\nconst availableGoals = Array.isArray(body.availableGoals) ? body.availableGoals.filter(Boolean) : [];\nconst availableActivities = Array.isArray(body.availableActivities) ? body.availableActivities.filter(Boolean) : [];\nconst lessonPath = (body.lessonPath || '').toString().trim();\nconst unitName = (body.unitName || '').toString().trim();\n\nreturn [{\n  json: {\n    grade,\n    subject,\n    lessonTitle,\n    lessonPath,\n    unitName,\n    availableStrategies,\n    availableTools,\n    availableGoals,\n    availableActivities,\n    strategiesText: availableStrategies.length ? availableStrategies.map((s, i) => `${i + 1}. ${s}`).join('\\n') : 'لا توجد خيارات متاحة',\n    toolsText: availableTools.length ? availableTools.map((s, i) => `${i + 1}. ${s}`).join('\\n') : 'لا توجد خيارات متاحة',\n    goalsText: availableGoals.length ? availableGoals.map((s, i) => `${i + 1}. ${s}`).join('\\n') : 'لا توجد أهداف متاحة',\n    activitiesText: availableActivities.length ? availableActivities.map((s, i) => `${i + 1}. ${s}`).join('\\n') : 'لا توجد أنشطة متاحة'\n  }\n}];"
+      },
+      "name": "Validate Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-560, 300],
+      "id": "validate-input-001"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "HTTP-Referer",
+              "value": "https://schools.madrasati.sa"
+            },
+            {
+              "name": "X-Title",
+              "value": "Tahdiri Lesson Plan Generator"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"openai/gpt-4o\",\n  \"temperature\": 0.7,\n  \"max_tokens\": 2500,\n  \"response_format\": { \"type\": \"json_object\" },\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"أنت خبير تربوي متخصص في المناهج السعودية ووزارة التعليم، ومهمتك إعداد خطة درس احترافية ومتخصصة لمعلم/ة على منصة مدرستي.\\n\\n# قواعد صارمة (يجب الالتزام بها 100%):\\n1. الإجابة كاملة باللغة العربية الفصحى البسيطة المناسبة لطلاب المرحلة المحددة.\\n2. كل النصوص يجب أن تكون **plain text فقط** - ممنوع استخدام Markdown أو ** أو # أو - كنقاط أو أي رموز تنسيق.\\n3. كل نص يجب أن يكون **مخصصاً للدرس بالاسم** - اذكر اسم الدرس أو موضوعه الفعلي في النص. ممنوع استخدام عبارات عامة مثل (موضوع الدرس) أو (الدرس الحالي).\\n4. لا تكرر نفس الفكرة في حقلين مختلفين.\\n5. للقوائم (strategies, tools, goals, activities): اختر **فقط** من القائمة المتاحة في رسالة المستخدم. ممنوع تماماً اختراع أي قيمة جديدة. لو القائمة فارغة، أرجع array فارغ [].\\n6. الاختيار يجب أن يكون **مناسباً للدرس بالاسم** - مش عشوائي.\\n\\n# الـ JSON Schema المطلوب (التزم بالأسماء بدقة):\\n{\\n  \\\"LectureClassPreparationText\\\": \\\"نص التمهيد - 2-3 جمل تربط الدرس بالخبرات السابقة وتمهد لموضوعه باسم محدد\\\",\\n  \\\"LessonVocabulary\\\": \\\"المفردات الرئيسة للدرس (3-5 مفردات حقيقية من الدرس باسمه، مفصولة بفاصلة)\\\",\\n  \\\"ThinkingSkills\\\": \\\"مهارات التفكير المستهدفة (3-4 مهارات محددة مناسبة للدرس باسمه)\\\",\\n  \\\"LectureClassCloseText\\\": \\\"نص غلق الدرس - 2-3 جمل لتلخيص ما تعلمه الطلاب من الدرس باسمه\\\",\\n  \\\"TeacherNote\\\": \\\"ملاحظة للمعلم/ة عن نقاط مهمة في تدريس الدرس باسمه\\\",\\n  \\\"goals\\\": [\\\"اختيارات من قائمة الأهداف المتاحة فقط - أو [] لو القائمة فارغة\\\"],\\n  \\\"strategies\\\": [\\\"اختيارات من قائمة الاستراتيجيات المتاحة فقط - 2 إلى 4 استراتيجيات مناسبة للدرس\\\"],\\n  \\\"tools\\\": [\\\"اختيارات من قائمة الوسائل المتاحة فقط - 2 إلى 4 وسائل مناسبة للدرس\\\"],\\n  \\\"activities\\\": [\\\"اختيارات من قائمة الأنشطة المتاحة فقط - أو [] لو القائمة فارغة\\\"],\\n  \\\"homework\\\": \\\"واجب منزلي محدد ومرتبط بمحتوى الدرس بالاسم - جملة واحدة واضحة\\\",\\n  \\\"preparationActivity\\\": \\\"نشاط تمهيدي محدد للدرس - يختلف عن LectureClassPreparationText\\\",\\n  \\\"closureActivity\\\": \\\"نشاط ختامي محدد للدرس - يختلف عن LectureClassCloseText\\\",\\n  \\\"examGoal\\\": \\\"هدف من التقويم مرتبط باسم الدرس\\\"\\n}\\n\\n# مثال على الجودة المطلوبة:\\nلو الدرس اسمه (الطرح--تمثيل الطرح) في مادة الرياضيات للصف الأول الابتدائي:\\n- LectureClassPreparationText: \\\"نراجع مع الطلاب مفهوم الجمع الذي تعلموه سابقاً، ثم نطرح موقفاً حياتياً عن نقصان عدد التفاحات من السلة لنمهد لمفهوم تمثيل الطرح\\\"\\n- LessonVocabulary: \\\"الطرح، النقصان، الفرق، علامة الطرح، التمثيل\\\"\\n- ليس: \\\"المفردات الرئيسة المرتبطة بموضوع الدرس\\\" (هذا عام ومرفوض).\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"# بيانات الدرس\\nالمرحلة/الصف: {{ $json.grade }}\\nالمادة: {{ $json.subject }}\\nاسم الدرس بالتحديد: {{ $json.lessonTitle }}\\nالوحدة: {{ $json.unitName }}\\nالمسار الكامل: {{ $json.lessonPath }}\\n\\n# القوائم المتاحة (لا تخترع شيئاً خارجها)\\n\\n## الاستراتيجيات المتاحة:\\n{{ $json.strategiesText }}\\n\\n## الوسائل المتاحة:\\n{{ $json.toolsText }}\\n\\n## الأهداف المتاحة:\\n{{ $json.goalsText }}\\n\\n## الأنشطة المتاحة:\\n{{ $json.activitiesText }}\\n\\nالآن أنشئ خطة الدرس بصيغة JSON كاملة وفق المطلوب. تذكر: كل نص لازم يذكر اسم الدرس الحقيقي ({{ $json.lessonTitle }}) وليس عبارات عامة.\"\n    }\n  ]\n}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [-300, 300],
+      "id": "ai-call-001",
+      "name": "Call GPT-4o",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "OpenRouter API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse and validate AI response\nconst response = $input.first().json;\nconst inputData = $('Validate Input').first().json;\n\nlet aiContent;\ntry {\n  const rawContent = response.choices && response.choices[0] && response.choices[0].message && response.choices[0].message.content;\n  if (!rawContent) {\n    throw new Error('No content from AI');\n  }\n  aiContent = typeof rawContent === 'string' ? JSON.parse(rawContent) : rawContent;\n} catch (err) {\n  // Fallback: return safe defaults so the extension does not crash\n  return [{\n    json: {\n      LectureClassPreparationText: `تمهيد لدرس ${inputData.lessonTitle} بربطه بالمعارف السابقة في ${inputData.subject}`,\n      LessonVocabulary: `المفردات الأساسية لدرس ${inputData.lessonTitle}`,\n      ThinkingSkills: 'الملاحظة، التحليل، الاستنتاج، حل المشكلات',\n      LectureClassCloseText: `تلخيص أهم ما تعلمه الطلاب في درس ${inputData.lessonTitle}`,\n      TeacherNote: `يراعى تنوع مستويات الطلاب أثناء شرح درس ${inputData.lessonTitle}`,\n      goals: [],\n      strategies: [],\n      tools: [],\n      activities: [],\n      homework: `حل تمارين درس ${inputData.lessonTitle} في كتاب الطالب`,\n      preparationActivity: `نشاط افتتاحي لدرس ${inputData.lessonTitle}`,\n      closureActivity: `نشاط ختامي لدرس ${inputData.lessonTitle}`,\n      examGoal: `قياس مدى استيعاب الطلاب لدرس ${inputData.lessonTitle}`,\n      _fallback: true,\n      _error: err.message\n    }\n  }];\n}\n\n// Strip markdown chars defensively (** __ ## etc.)\nfunction stripMarkdown(str) {\n  if (typeof str !== 'string') return str;\n  return str\n    .replace(/\\*\\*/g, '')\n    .replace(/__/g, '')\n    .replace(/^#+\\s*/gm, '')\n    .replace(/^-\\s*/gm, '')\n    .replace(/`/g, '')\n    .trim();\n}\n\n// Validate arrays only contain values from available lists\nfunction filterArray(arr, available) {\n  if (!Array.isArray(arr)) return [];\n  if (!Array.isArray(available) || !available.length) return [];\n  return arr.filter(item => available.includes(item));\n}\n\nconst result = {\n  LectureClassPreparationText: stripMarkdown(aiContent.LectureClassPreparationText || ''),\n  LessonVocabulary: stripMarkdown(aiContent.LessonVocabulary || ''),\n  ThinkingSkills: stripMarkdown(aiContent.ThinkingSkills || ''),\n  LectureClassCloseText: stripMarkdown(aiContent.LectureClassCloseText || ''),\n  TeacherNote: stripMarkdown(aiContent.TeacherNote || ''),\n  goals: filterArray(aiContent.goals, inputData.availableGoals),\n  strategies: filterArray(aiContent.strategies, inputData.availableStrategies),\n  tools: filterArray(aiContent.tools, inputData.availableTools),\n  activities: filterArray(aiContent.activities, inputData.availableActivities),\n  homework: stripMarkdown(aiContent.homework || ''),\n  preparationActivity: stripMarkdown(aiContent.preparationActivity || ''),\n  closureActivity: stripMarkdown(aiContent.closureActivity || ''),\n  examGoal: stripMarkdown(aiContent.examGoal || ''),\n  // Backwards compatibility with old extension code:\n  prep: stripMarkdown(aiContent.LectureClassPreparationText || ''),\n  closure: stripMarkdown(aiContent.LectureClassCloseText || ''),\n  vocabulary: stripMarkdown(aiContent.LessonVocabulary || '')\n};\n\nreturn [{ json: result }];"
+      },
+      "name": "Validate AI Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-40, 300],
+      "id": "validate-ai-001"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {}
+      },
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [220, 300],
+      "id": "respond-001"
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[{ "node": "Validate Input", "type": "main", "index": 0 }]]
+    },
+    "Validate Input": {
+      "main": [[{ "node": "Call GPT-4o", "type": "main", "index": 0 }]]
+    },
+    "Call GPT-4o": {
+      "main": [[{ "node": "Validate AI Response", "type": "main", "index": 0 }]]
+    },
+    "Validate AI Response": {
+      "main": [[{ "node": "Respond to Webhook", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "executionOrder": "v1" },
+  "pinData": {}
+}

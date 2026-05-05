@@ -1,0 +1,52 @@
+{
+  "manifest_version": 3,
+  "name": "تحضيري",
+  "description": "تبسيط تعديل واعداد الحصص للمعلم",
+  "version": "10.0.0",
+  "icons": {
+    "128": "logo/logo-128.jpg",
+    "16": "logo/logo-16.jpg",
+    "48": "logo/logo-48.jpg"
+  },
+  "action": {
+    "default_title": "تحضيري",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "logo/logo-16.jpg",
+      "48": "logo/logo-48.jpg",
+      "128": "logo/logo-128.jpg"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://schools.madrasati.sa/*",
+    "https://external.madrasati.sa/*",
+    "https://n8n.abdelati88.shop/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://schools.madrasati.sa/Teacher/LessonPreparation/*",
+        "https://external.madrasati.sa/Teacher/LessonPreparation/*",
+        "https://schools.madrasati.sa/Teacher/Preparation/*",
+        "https://external.madrasati.sa/Teacher/Preparation/*",
+        "https://schools.madrasati.sa/Teacher/Lessons/*",
+        "https://external.madrasati.sa/Teacher/Lessons/*",
+        "https://schools.madrasati.sa/SchoolSchedule/Schedule/*",
+        "https://external.madrasati.sa/SchoolSchedule/Schedule/*"
+      ],
+      "js": [
+        "shared/constants.js",
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "options_page": "options.html"
+}
