@@ -41,6 +41,7 @@ function getCompetitorText(type, lessonName) {
   var AUTOMATION_STATE_KEY = STORAGE_KEYS.AUTOMATION_STATE || "automationState";
   var SAVE_SUBMITTED_AT_KEY = "automationSaveSubmittedAt";
   var AI_LESSON_DATA_KEY = "aiLessonData";
+  var AUTOMATION_MODE_KEY = "automationMode";
   var N8N_AI_WEBHOOK_URL = "https://n8n.abdelati88.shop/webhook/tahdiri-ai-generator";
   var ACTION_LOCK_PREFIX = "tahdiriActionLock";
   var STEP1_NEXT_LOCK_TTL_MS = 9e4;
@@ -50,6 +51,7 @@ function getCompetitorText(type, lessonName) {
     container: "tahdiri-container",
     primary: "tahdiri-primary-btn",
     aiBtn: "tahdiri-ai-btn",
+    quickBtn: "tahdiri-quick-btn",
     advanced: "tahdiri-advanced-btn",
     status: "tahdiri-status"
   });
@@ -498,6 +500,8 @@ function getCompetitorText(type, lessonName) {
     start: async () => {
     },
     startAI: async () => {
+    },
+    startQuick: async () => {
     }
   };
   var removeUiTimer = null;
@@ -554,6 +558,9 @@ function getCompetitorText(type, lessonName) {
   function getAIButton() {
     return document.getElementById(UI_IDS.aiBtn);
   }
+  function getQuickButton() {
+    return document.getElementById(UI_IDS.quickBtn);
+  }
   function setButtonsDisabled(disabled) {
     const primary = getPrimaryButton();
     const advanced = getAdvancedButton();
@@ -567,6 +574,12 @@ function getCompetitorText(type, lessonName) {
       aiBtnEl.disabled = disabled;
       aiBtnEl.style.opacity = disabled ? "0.6" : "1";
       aiBtnEl.style.cursor = disabled ? "not-allowed" : "pointer";
+    }
+    const quickBtnEl = getQuickButton();
+    if (quickBtnEl) {
+      quickBtnEl.disabled = disabled;
+      quickBtnEl.style.opacity = disabled ? "0.6" : "1";
+      quickBtnEl.style.cursor = disabled ? "not-allowed" : "pointer";
     }
     if (advanced) {
       advanced.disabled = disabled;
@@ -663,6 +676,15 @@ function getCompetitorText(type, lessonName) {
     applyButtonStyle(aiBtn, "linear-gradient(135deg, #7c3aed 0%, #a855f7 100%)");
     aiBtn.innerHTML = `<span class="tahdiri-btn-icon">${aiIconSVG()}</span>
      <span class="tahdiri-btn-label">\u{1F916} \u062A\u062D\u0636\u064A\u0631 \u0627\u0644\u062F\u0631\u0633 \u062A\u0644\u0642\u0627\u0626\u064A\u0627\u064B</span>`;
+    const quickBtn = document.createElement("button");
+    quickBtn.id = UI_IDS.quickBtn;
+    quickBtn.type = "button";
+    applyButtonStyle(quickBtn, "linear-gradient(135deg, #1a9448 0%, #0f7a36 100%)");
+    quickBtn.innerHTML = `<span class="tahdiri-btn-icon">\u26A1</span>
+     <span class="tahdiri-btn-label">\u062A\u062D\u0636\u064A\u0631 \u0633\u0631\u064A\u0639</span>`;
+    const quickTooltip = document.createElement("div");
+    quickTooltip.style.cssText = "font-size:10px;color:#6b7c93;text-align:center;margin-top:-4px";
+    quickTooltip.textContent = "\u0623\u0633\u0631\u0639 \u062A\u062D\u0636\u064A\u0631 \u0645\u0645\u0643\u0646 - \u064A\u0633\u062A\u062E\u062F\u0645 \u0628\u064A\u0627\u0646\u0627\u062A \u0645\u0646\u0635\u0629 \u0645\u062F\u0631\u0633\u062A\u064A \u0645\u0628\u0627\u0634\u0631\u0629";
     const advanced = document.createElement("button");
     advanced.id = UI_IDS.advanced;
     advanced.type = "button";
@@ -704,10 +726,13 @@ function getCompetitorText(type, lessonName) {
     aiBtn.addEventListener("click", async () => {
       await controlPanelHandlers.startAI();
     });
+    quickBtn.addEventListener("click", async () => {
+      await controlPanelHandlers.startQuick();
+    });
     advanced.addEventListener("click", async () => {
       await controlPanelHandlers.start("step1Only");
     });
-    container.append(header, divider, primary, aiBtn, advanced, stepBar, status);
+    container.append(header, divider, primary, aiBtn, quickBtn, quickTooltip, advanced, stepBar, status);
     document.documentElement.appendChild(container);
   }
   function applyButtonStyle(button, background) {
@@ -1663,6 +1688,156 @@ function getCompetitorText(type, lessonName) {
     } catch (err) {
       log("fetchAILessonData: error:", err);
       return null;
+    }
+  }
+  async function fetchQuickPrepData(subjectId, lessonId) {
+    try {
+      const csrfToken = getFieldValue('input[name="__RequestVerificationToken"]');
+      // Fetch lesson goals
+      const goalsRes = await fetch("/LearningResources/MangeResources/GetGoalLessonSubject", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "requestverificationtoken": csrfToken || ""
+        },
+        body: "subjectId=" + encodeURIComponent(subjectId),
+        credentials: "same-origin"
+      });
+      if (!goalsRes.ok) {
+        log("fetchQuickPrepData: goals API error", goalsRes.status);
+        return null;
+      }
+      const allGoals = await goalsRes.json();
+      if (!Array.isArray(allGoals)) {
+        log("fetchQuickPrepData: goals response is not an array");
+        return null;
+      }
+      const lessonIdNum = parseInt(lessonId, 10);
+      const goals = allGoals.filter(function(g) { return g.LessonId === lessonIdNum; });
+      log("fetchQuickPrepData: goals found", goals.length, "for lessonId", lessonIdNum);
+      // Fetch student books
+      const booksRes = await fetch("/Teacher/Subjects/GetStudentBooks?Id=" + encodeURIComponent(subjectId), {
+        credentials: "same-origin"
+      });
+      const books = [];
+      if (booksRes.ok) {
+        const booksHtml = await booksRes.text();
+        const parser = new DOMParser();
+        const booksDoc = parser.parseFromString(booksHtml, "text/html");
+        const titles = booksDoc.querySelectorAll(".project-title");
+        const links = booksDoc.querySelectorAll(".project-actions a");
+        const count = Math.min(titles.length, links.length);
+        for (let i = 0; i < count; i++) {
+          books.push({
+            name: (titles[i].textContent || "").trim(),
+            link: (links[i].getAttribute("href") || "").trim()
+          });
+        }
+        log("fetchQuickPrepData: books found", books.length);
+      } else {
+        log("fetchQuickPrepData: books API error", booksRes.status);
+      }
+      return { goals, books };
+    } catch (err) {
+      log("fetchQuickPrepData: error", err);
+      return null;
+    }
+  }
+  function buildLessonPlanFromGoals(goals, books, lessonName, tree2Value) {
+    const name = lessonName || "الدرس";
+    const einLink = "https://ibs.ien.edu.sa/#/planslessons/" + (tree2Value || "");
+    const goalIds = Array.isArray(goals) ? goals.map(function(g) { return g.GoalId; }).filter(Boolean) : [];
+
+    var firstGoalTitle = "";
+    var lastGoalTitle = "";
+    if (Array.isArray(goals) && goals.length > 0) {
+      firstGoalTitle = (goals[0].GoalTitle || "").trim();
+      lastGoalTitle  = (goals[goals.length - 1].GoalTitle || "").trim();
+    }
+
+    var prepText, closeText, homeworkText;
+
+    if (!Array.isArray(goals) || goals.length === 0) {
+      // Zero goals: lesson-name-only templates
+      prepText    = "نراجع مع الطلاب المعارف السابقة، ثم نمهد لدرس \"" + name + "\" من خلال طرح موقف يومي مرتبط بموضوع الدرس.";
+      closeText   = "نلخص مع الطلاب أهم ما تعلموه في درس \"" + name + "\".";
+      homeworkText = "حل تمارين درس \"" + name + "\" في كتاب التمارين.";
+    } else if (goals.length === 1) {
+      // One goal: different phrasing for prep vs closure so they are not identical
+      prepText    = "نراجع مع الطلاب المعارف السابقة، ثم نمهد لدرس \"" + name + "\" من خلال طرح موقف يومي مرتبط بـ " + firstGoalTitle + ".";
+      closeText   = "نلخص مع الطلاب أهم ما تعلموه في درس \"" + name + "\"، ونتأكد من تحقق الهدف: " + lastGoalTitle + ".";
+      homeworkText = "حل تمارين درس \"" + name + "\" في كتاب التمارين، ومراجعة هدف: " + firstGoalTitle + ".";
+    } else {
+      // Two or more goals: first → prep, last → closure
+      prepText    = "نراجع مع الطلاب المعارف السابقة، ثم نمهد لدرس \"" + name + "\" من خلال طرح موقف يومي مرتبط بـ " + firstGoalTitle + ".";
+      closeText   = "نلخص مع الطلاب أهم ما تعلموه في درس \"" + name + "\"، ونتأكد من تحقق الهدف: " + lastGoalTitle + ".";
+      homeworkText = "حل تمارين درس \"" + name + "\" في كتاب التمارين، ومراجعة هدف: " + firstGoalTitle + ".";
+    }
+
+    var vocabularyText =
+      "مفردات الدرس: راجع الكتاب الإلكتروني درس (" + name + ").\n" +
+      "تجد روابط الكتب الإلكترونية في قسم الإثراء.";
+
+    var thinkingSkillsText =
+      "التركيز - التذكر - التحليل - التركيب - الربط - الملاحظة - الاستنتاج - التفكير الإبداعي - العصف الذهني";
+
+    var teacherNoteText =
+      "بإمكانك الاطلاع على شرح هذا الدرس على منصة عين وحل بعض الأسئلة ومشاهدة المزيد من الإثراءات من خلال:\n" +
+      "أولاً: تسجيل الدخول لمنصة عين بحسابك.\n" +
+      "ثانياً: فتح رابط هذا الدرس وهو:\n" +
+      einLink;
+
+    return {
+      LectureClassPreparationText: prepText,
+      LessonVocabulary:            vocabularyText,
+      ThinkingSkills:              thinkingSkillsText,
+      LectureClassCloseText:       closeText,
+      TeacherNote:                 teacherNoteText,
+      goalIds:                     goalIds,
+      einLink:                     einLink,
+      homework:                    homeworkText
+    };
+  }
+  function applyQuickPrepToForm(plan) {
+    const lessonRoot = getLessonFormRoot();
+    const fieldMap = {
+      LectureClassPreparationText: plan.LectureClassPreparationText,
+      LessonVocabulary:            plan.LessonVocabulary,
+      ThinkingSkills:              plan.ThinkingSkills,
+      LectureClassCloseText:       plan.LectureClassCloseText,
+      TeacherNote:                 plan.TeacherNote
+    };
+    for (const fieldId of Object.keys(fieldMap)) {
+      const el = lessonRoot.querySelector("#" + CSS.escape(fieldId));
+      const found   = !!el;
+      const visible = found && isTrulyVisible(el);
+      const usable  = visible && !el.disabled && !el.readOnly;
+      log("applyQuickPrepToForm:", fieldId, "found=", found, "visible=", visible, "usable=", usable);
+      if (usable) {
+        setNativeValue(el, fieldMap[fieldId]);
+        log("applyQuickPrepToForm: setNativeValue called for", fieldId);
+      }
+    }
+    // Homework: heuristic search by id/name/label containing "واجب" or "homework"
+    if (plan.homework) {
+      const homeworkCandidates = Array.from(
+        lessonRoot.querySelectorAll('input[type="text"], textarea')
+      ).filter(function(el) {
+        if (!isTrulyVisible(el) || el.disabled || el.readOnly) return false;
+        if (el.closest("#CreateResourceForm")) return false;
+        const idName = (el.id || "") + " " + (el.name || "");
+        if (/واجب|homework/i.test(idName)) return true;
+        const labelEl = el.id
+          ? document.querySelector('label[for="' + CSS.escape(el.id) + '"]')
+          : null;
+        const labelText = labelEl ? (labelEl.textContent || "") : "";
+        return /واجب|homework/i.test(labelText);
+      });
+      log("applyQuickPrepToForm: homework candidates found=", homeworkCandidates.length);
+      if (homeworkCandidates.length > 0) {
+        log("applyQuickPrepToForm: filling homework field id=", homeworkCandidates[0].id, "name=", homeworkCandidates[0].name);
+        setNativeValue(homeworkCandidates[0], plan.homework);
+      }
     }
   }
   function getCsrfToken() {
@@ -2954,6 +3129,111 @@ function getCompetitorText(type, lessonName) {
       isSaving = false;
     }
   }
+  async function runQuickPrepStep2Flow() {
+    if (isSaving) {
+      return buildResult(false, "A save action is already in progress", { code: "already-saving" });
+    }
+    isSaving = true;
+    try {
+      log("runQuickPrepStep2Flow: START pathname=", window.location.pathname);
+      updatePrimaryButton("جاري التحضير السريع...", "loading");
+      updateControlStatus("جاري تهيئة صفحة التحضير...", "info");
+
+      // Wait for React-rendered textareas
+      await waitForElement("textarea", 15000);
+      await sleep(1000);
+      await closeBlockingTourDialog();
+
+      // Read path values from hidden inputs that persist on Page 2
+      const subjectId  = getFieldValue("#SelectedUnitId");
+      const lessonId   = getFieldValue("#SelectedTrees_4") || getFieldValue("#SelectedTrees_3");
+      const tree2Value = getFieldValue("#SelectedTrees_2");
+      const lessonName = getCurrentLessonName();
+
+      log("runQuickPrepStep2Flow: subjectId=", subjectId, "lessonId=", lessonId, "tree2=", tree2Value, "name=", lessonName);
+
+      // Fetch goals + books from internal Madrasati APIs
+      updateControlStatus("جاري جلب أهداف الدرس من منصة مدرستي...", "info");
+      const quickData = await fetchQuickPrepData(subjectId, lessonId);
+
+      log("runQuickPrepStep2Flow: fetchQuickPrepData returned:", quickData === null ? "null" : ("ok, goals=" + (quickData.goals ? quickData.goals.length : 0) + " books=" + (quickData.books ? quickData.books.length : 0)));
+
+      if (!quickData) {
+        // API failed — fall back to the existing non-AI flow
+        log("runQuickPrepStep2Flow: falling back to fillLessonFields");
+        updateControlStatus("تعذر جلب بيانات المنصة، يتم استخدام النصوص الافتراضية.", "warning");
+        await fillLessonFields(null);
+        await markLessonCheckboxes(null);
+      } else {
+        // Build the structured plan from API data
+        const plan = buildLessonPlanFromGoals(quickData.goals, quickData.books, lessonName, tree2Value);
+        log("runQuickPrepStep2Flow: plan keys:", {
+          LectureClassPreparationText: (plan.LectureClassPreparationText || "").substring(0, 50),
+          LessonVocabulary:            (plan.LessonVocabulary || "").substring(0, 50),
+          ThinkingSkills:              (plan.ThinkingSkills || "").substring(0, 50),
+          LectureClassCloseText:       (plan.LectureClassCloseText || "").substring(0, 50),
+          TeacherNote:                 (plan.TeacherNote || "").substring(0, 50),
+          goalIds:                     plan.goalIds,
+          einLink:                     plan.einLink,
+          homework:                    (plan.homework || "").substring(0, 50)
+        });
+
+        // Fill text fields
+        updateControlStatus("جاري تعبئة حقول التحضير...", "info");
+        applyQuickPrepToForm(plan);
+
+        // Check goal checkboxes by matching GoalId against checkbox value attributes
+        if (plan.goalIds && plan.goalIds.length > 0) {
+          const lessonRoot = getLessonFormRoot();
+          const goalCheckboxes = Array.from(lessonRoot.querySelectorAll('input[name="goals"]')).filter(isCheckboxUsable);
+          log("runQuickPrepStep2Flow: goals checkboxes found=", goalCheckboxes.length, "goalIds to match=", plan.goalIds);
+          let matchedCount = 0;
+          for (const cb of goalCheckboxes) {
+            const cbVal = parseInt(cb.value, 10);
+            if (plan.goalIds.indexOf(cbVal) !== -1) {
+              ensureCheckboxChecked(cb);
+              matchedCount++;
+            }
+          }
+          log("runQuickPrepStep2Flow: goal checkboxes matched and checked=", matchedCount);
+        } else {
+          log("runQuickPrepStep2Flow: no goalIds to check, skipping goal checkboxes");
+        }
+
+        // Ensure other required checkbox groups are filled (strategies, activities, etc.)
+        await markLessonCheckboxes(null);
+      }
+
+      // Add mandatory enrichment/assignment so the platform accepts the save
+      updateControlStatus("جاري إضافة الإثراء المطلوب...", "info");
+      await ensureLessonRequirementSatisfied();
+
+      // Allow enrichment DOM tokens to settle before save
+      await sleep(2000);
+
+      // Save
+      updateControlStatus("جاري حفظ الدرس...", "loading");
+      log("runQuickPrepStep2Flow: about to call findFinalSaveButton2");
+      const saveButton = await findFinalSaveButton2();
+      log("runQuickPrepStep2Flow: findFinalSaveButton2 returned:", saveButton ? ("found, text=" + (saveButton.textContent || "").trim().substring(0, 40)) : "null");
+      if (!saveButton) {
+        throw new Error("لم يتم العثور على زر الحفظ");
+      }
+      saveButton.click();
+      log("runQuickPrepStep2Flow: save button clicked");
+
+      updatePrimaryButton("تم إرسال التحضير للمنصة! ⚡", "success");
+      updateControlStatus("تم التحضير السريع وحفظ الدرس بنجاح.", "success");
+      return buildResult(true, "تم التحضير السريع بنجاح");
+
+    } catch (error) {
+      log("runQuickPrepStep2Flow error:", error);
+      updateControlStatus("حدث خطأ أثناء التحضير السريع", "error");
+      return buildResult(false, error.message || "خطأ غير متوقع", { code: "quick-step2-error" });
+    } finally {
+      isSaving = false;
+    }
+  }
 
 
   // src/content/index.js
@@ -2982,13 +3262,14 @@ function getCompetitorText(type, lessonName) {
     running: false,
     mode: "auto",
     async loadState() {
-      const data = await getLocal([AUTOMATION_STATE_KEY, "storedPathKey"]);
+      const data = await getLocal([AUTOMATION_STATE_KEY, AUTOMATION_MODE_KEY, "storedPathKey"]);
       this.state = data[AUTOMATION_STATE_KEY] || FLOW_STATES.IDLE;
+      this.mode  = data[AUTOMATION_MODE_KEY]  || "auto";
       return data;
     },
     async setState(nextState) {
       this.state = nextState;
-      const update = { [AUTOMATION_STATE_KEY]: nextState };
+      const update = { [AUTOMATION_STATE_KEY]: nextState, [AUTOMATION_MODE_KEY]: this.mode };
       if (nextState !== FLOW_STATES.IDLE) {
         update.storedPathKey = getAutomationActionKey("path-info");
       }
@@ -3123,6 +3404,32 @@ function getCompetitorText(type, lessonName) {
         this.starting = false;
       }
     },
+    async startQuick() {
+      injectControlPanel();
+      clearUiRemoval();
+      if (this.starting || this.running) {
+        updateControlStatus("التحضير يعمل بالفعل.", "info");
+        return;
+      }
+      this.starting = true;
+      try {
+        this.mode = "quick";
+        isEnabled = true;
+        const nextState = FLOW_STATES.STEP1;
+        await this.setState(nextState);
+        setButtonsDisabled(true);
+        const quickBtnEl = getQuickButton();
+        if (quickBtnEl) {
+          const labelEl = quickBtnEl.querySelector(".tahdiri-btn-label");
+          if (labelEl) labelEl.textContent = "⏳ جاري التحضير السريع...";
+        }
+        await sendAutomationStatus("START", { state: nextState, mode: "quick" });
+        updateControlStatus("تم بدء التحضير السريع.", "info");
+        void this.run();
+      } finally {
+        this.starting = false;
+      }
+    },
     async stop(reason) {
       isEnabled = false;
       this.running = false;
@@ -3191,7 +3498,9 @@ function getCompetitorText(type, lessonName) {
         }
         if (this.state === FLOW_STATES.STEP2) {
           step2CompletedThisSession = true;
-          const step2Result = await runStep2Flow();
+          const step2Result = this.mode === "quick"
+            ? await runQuickPrepStep2Flow()
+            : await runStep2Flow();
           if (!step2Result.ok) {
             if (step2Result.code === "duplicate-lesson") {
               await this.stop(step2Result.message || "A lesson is already registered for this timetable slot.");
@@ -3213,7 +3522,8 @@ function getCompetitorText(type, lessonName) {
   };
   setControlPanelHandlers({
     start: (mode) => AutomationController.start(mode),
-    startAI: () => AutomationController.startAI()
+    startAI: () => AutomationController.startAI(),
+    startQuick: () => AutomationController.startQuick()
   });
   setFinalSaveButtonDetector(findFinalSaveButtonSync);
   if (isContextAlive()) {
