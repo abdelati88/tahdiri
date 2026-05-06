@@ -467,13 +467,28 @@ function getCompetitorText(type, lessonName) {
   }
   async function selectLastOption(selectElement) {
     if (!selectElement || !selectElement.options || selectElement.options.length <= 1) return false;
-    selectElement.selectedIndex = selectElement.options.length - 1;
-    triggerEvents(selectElement, ["input", "change", "blur"]);
-    if (typeof selectElement.onchange === "function") {
-      try {
-        selectElement.onchange();
-      } catch {
-      }
+
+    // Use the native HTMLSelectElement prototype setter so React's internal fiber
+    // state sees this as a genuine user-driven change (prevents ghost-reset on
+    // the Next button click).
+    const nativeSetter = Object.getOwnPropertyDescriptor(
+      window.HTMLSelectElement.prototype, 'value'
+    )?.set;
+    const targetValue = selectElement.options[selectElement.options.length - 1].value;
+    if (nativeSetter) {
+      nativeSetter.call(selectElement, targetValue);
+    } else {
+      selectElement.selectedIndex = selectElement.options.length - 1;
+    }
+
+    // Dispatch bubbling events so React's synthetic system re-reads the value.
+    try { selectElement.dispatchEvent(new Event('input',  { bubbles: true })); } catch { }
+    try { selectElement.dispatchEvent(new Event('change', { bubbles: true })); } catch { }
+    try { selectElement.dispatchEvent(new Event('blur',   { bubbles: true })); } catch { }
+
+    // Also call the onchange handler if the page assigned one directly.
+    if (typeof selectElement.onchange === 'function') {
+      try { selectElement.onchange(); } catch { }
     }
     return true;
   }
@@ -2614,6 +2629,30 @@ function getCompetitorText(type, lessonName) {
     return false;
   }
   async function runStep1Flow() {
+    // ── Snapshot IDs into sessionStorage FIRST — before any DOM mutations ──────
+    // The radio-button interactions below (LessonType, TARGET_RADIOS) trigger a
+    // React state wipe that clears #SelectedUnitId and #SelectedTrees_* from the
+    // DOM.  We must capture the user's manually-chosen values at the very instant
+    // the button is clicked, before we touch anything else on the page.
+    try {
+      const _snapUnitId  = getFieldValue("#SelectedUnitId");
+      const _snapTree2   = getFieldValue("#SelectedTrees_2");
+      const _snapTree3   = getFieldValue("#SelectedTrees_3");
+      const _snapTree4   = getFieldValue("#SelectedTrees_4");
+      const _snapTree5   = getFieldValue("#SelectedTrees_5");
+      const _snapPayload = JSON.stringify({
+        subjectId:  _snapUnitId,
+        tree2:      _snapTree2,
+        tree3:      _snapTree3,
+        lessonId:   _snapTree4 || _snapTree3,   // tree4 when present, else tree3
+        tree5:      _snapTree5
+      });
+      window.sessionStorage.setItem("tahdiri_quick_ids", _snapPayload);
+      console.log("[تحضيري] Step1: snapshotted IDs into sessionStorage:", _snapPayload);
+    } catch (_snapErr) {
+      console.warn("[تحضيري] Step1: could not snapshot IDs", _snapErr);
+    }
+    // ─────────────────────────────────────────────────────────────────────────
     updatePrimaryButton("\u062C\u0627\u0631\u064A \u0625\u0639\u062F\u0627\u062F \u0627\u0644\u0645\u0633\u0627\u0631...", "loading");
     updateControlStatus("\u064A\u062A\u0645 \u0627\u0644\u0622\u0646 \u0627\u062E\u062A\u064A\u0627\u0631 \u0627\u0644\u0645\u0633\u0627\u0631 \u0627\u0644\u062F\u0631\u0627\u0633\u064A \u0648\u062E\u064A\u0627\u0631\u0627\u062A \u0627\u0644\u062F\u0631\u0633 \u0627\u0644\u0645\u0637\u0644\u0648\u0628\u0629...", "info");
     // Check for stored dashboard selection
@@ -2662,6 +2701,7 @@ function getCompetitorText(type, lessonName) {
       updateControlStatus("\u062A\u0645 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u062E\u0637\u0648\u0629 \u0627\u0644\u0623\u0648\u0644\u0649 \u0645\u0633\u0628\u0642\u064B\u0627 \u0644\u0647\u0630\u0627 \u0627\u0644\u062F\u0631\u0633. \u0628\u0627\u0646\u062A\u0638\u0627\u0631 \u0646\u0645\u0648\u0630\u062C \u0627\u0644\u062F\u0631\u0633...", "info");
       return buildResult(true, "\u062A\u0645 \u0625\u0631\u0633\u0627\u0644 \u0627\u0644\u062E\u0637\u0648\u0629 \u0627\u0644\u0623\u0648\u0644\u0649 \u0645\u0633\u0628\u0642\u064B\u0627");
     }
+
     activateElementOnce(nextButton);
     lockActionElement(nextButton);
     const duplicateLessonError = await waitForValue(() => findDuplicateLessonErrorMessage(), 3e3, 250);
@@ -3144,13 +3184,66 @@ function getCompetitorText(type, lessonName) {
       await sleep(1000);
       await closeBlockingTourDialog();
 
-      // Read path values from hidden inputs that persist on Page 2
-      const subjectId  = getFieldValue("#SelectedUnitId");
-      const lessonId   = getFieldValue("#SelectedTrees_4") || getFieldValue("#SelectedTrees_3");
-      const tree2Value = getFieldValue("#SelectedTrees_2");
+      // ── Restore IDs from sessionStorage into Step 2 DOM ─────────────────────
+      // React wiped the <select> elements during the Step 1 → Step 2 navigation.
+      // We must write them back NOW so:
+      //   (a) the native form payload sent on Save contains a valid lesson path
+      //       (empty path = silent server rejection), and
+      //   (b) fetchQuickPrepData receives the correct subjectId / lessonId.
+      let subjectId  = "";
+      let lessonId   = "";
+      let tree2Value = "";
+      let tree3Value = "";
+      let tree5Value = "";
+      try {
+        const _raw = window.sessionStorage.getItem("tahdiri_quick_ids");
+        if (_raw) {
+          const _ids = JSON.parse(_raw);
+          subjectId  = _ids.subjectId || "";
+          lessonId   = _ids.lessonId  || "";
+          tree2Value = _ids.tree2     || "";
+          tree3Value = _ids.tree3     || "";
+          tree5Value = _ids.tree5     || "";
+          console.log("[تحضيري] Step2 Quick: IDs read from sessionStorage snapshot:",
+            "subjectId=", subjectId, "lessonId=", lessonId,
+            "tree2=", tree2Value, "tree3=", tree3Value
+          );
+
+          // ── Inject back into the DOM so the form payload is complete ──────
+          const _domMap = {
+            "SelectedUnitId":   subjectId,
+            "SelectedTrees_2":  tree2Value,
+            "SelectedTrees_3":  tree3Value,
+            "SelectedTrees_4":  lessonId,
+            "SelectedTrees_5":  tree5Value
+          };
+          for (const [_id, _val] of Object.entries(_domMap)) {
+            if (!_val) continue;
+            const _el = document.getElementById(_id);
+            if (_el) {
+              setNativeValue(_el, _val);
+              console.log("[تحضيري] Step2 Quick: restored #" + _id + " =", _val);
+            }
+          }
+          // ─────────────────────────────────────────────────────────────────
+        } else {
+          console.warn("[تحضيري] Step2 Quick: no sessionStorage snapshot found, falling back to DOM.");
+          subjectId  = getFieldValue("#SelectedUnitId");
+          lessonId   = getFieldValue("#SelectedTrees_4") || getFieldValue("#SelectedTrees_3");
+          tree2Value = getFieldValue("#SelectedTrees_2");
+        }
+      } catch (_readErr) {
+        console.warn("[تحضيري] Step2 Quick: sessionStorage read error, falling back to DOM.", _readErr);
+        subjectId  = getFieldValue("#SelectedUnitId");
+        lessonId   = getFieldValue("#SelectedTrees_4") || getFieldValue("#SelectedTrees_3");
+        tree2Value = getFieldValue("#SelectedTrees_2");
+      }
+      // ─────────────────────────────────────────────────────────────────────────
       const lessonName = getCurrentLessonName();
 
       log("runQuickPrepStep2Flow: subjectId=", subjectId, "lessonId=", lessonId, "tree2=", tree2Value, "name=", lessonName);
+      console.log("[تحضيري] Step2 Quick: about to call fetchQuickPrepData with",
+        "subjectId=", subjectId, "lessonId=", lessonId);
 
       // Fetch goals + books from internal Madrasati APIs
       updateControlStatus("جاري جلب أهداف الدرس من منصة مدرستي...", "info");
@@ -3211,7 +3304,11 @@ function getCompetitorText(type, lessonName) {
       // Allow enrichment DOM tokens to settle before save
       await sleep(2000);
 
-      // Save
+      // ── Save with full completion guard ──────────────────────────────────────
+      // Use waitForSaveCompletion() instead of a bare .click() so we benefit
+      // from: validation-error detection, duplicate-lesson detection, missing-
+      // resource recovery, and page-transition confirmation — exactly the same
+      // guarantees runStep2Flow() already has.
       updateControlStatus("جاري حفظ الدرس...", "loading");
       log("runQuickPrepStep2Flow: about to call findFinalSaveButton2");
       const saveButton = await findFinalSaveButton2();
@@ -3219,8 +3316,17 @@ function getCompetitorText(type, lessonName) {
       if (!saveButton) {
         throw new Error("لم يتم العثور على زر الحفظ");
       }
-      saveButton.click();
-      log("runQuickPrepStep2Flow: save button clicked");
+
+      // Delegate to the hardened save-completion loop (handles modals, errors,
+      // and navigation confirmation).  DO NOT call saveButton.click() directly.
+      const saveResult = await waitForSaveCompletion(saveButton);
+      log("runQuickPrepStep2Flow: waitForSaveCompletion result:", saveResult);
+
+      if (!saveResult.ok) {
+        // Propagate structured error so the caller can surface it to the user.
+        return saveResult;
+      }
+      // ────────────────────────────────────────────────────────────────────────
 
       updatePrimaryButton("تم إرسال التحضير للمنصة! ⚡", "success");
       updateControlStatus("تم التحضير السريع وحفظ الدرس بنجاح.", "success");
@@ -3415,7 +3521,7 @@ function getCompetitorText(type, lessonName) {
       try {
         this.mode = "quick";
         isEnabled = true;
-        const nextState = FLOW_STATES.STEP1;
+        const nextState = detectPageState() === FLOW_STATES.STEP2 ? FLOW_STATES.STEP2 : FLOW_STATES.STEP1;
         await this.setState(nextState);
         setButtonsDisabled(true);
         const quickBtnEl = getQuickButton();
