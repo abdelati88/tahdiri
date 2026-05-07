@@ -2,6 +2,7 @@
 // - Handles toolbar action click to toggle automation per-tab
 // - Persists state in chrome.storage
 // - Relays START/STOP messages to content scripts
+// - Proxies cross-origin requests to k.tahdiri.com (CORS bypass)
 
 importScripts('shared/constants.js');
 
@@ -80,6 +81,46 @@ chrome.action.onClicked.addListener(async (tab) => {
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // ── COMPETITOR_FETCH — CORS bypass proxy ────────────────────────────────────
+  // content.js cannot reach https://k.tahdiri.com directly (CORS blocked).
+  // It posts a message here; the service worker fetches on its behalf and
+  // returns the raw encrypted response text.
+  //
+  // Message:  { action: 'COMPETITOR_FETCH', url, method?, body? }
+  // Response: { ok: true,  text: '<encrypted string>' }
+  //           { ok: false, error: '<message>' }
+  // ───────────────────────────────────────────────────────────────────────────
+  if (msg?.action === 'COMPETITOR_FETCH') {
+    const { url, method = 'GET', body = null } = msg;
+
+    if (!url || typeof url !== 'string') {
+      sendResponse({ ok: false, error: 'COMPETITOR_FETCH: missing or invalid url' });
+      return true;
+    }
+
+    const fetchOptions = {
+      method,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': '*/*',
+        'Origin': 'https://k.tahdiri.com',
+        'Referer': 'https://k.tahdiri.com/',
+      }
+    };
+
+    if (body) {
+      fetchOptions.headers['Content-Type'] = 'application/x-www-form-urlencoded';
+      fetchOptions.body = body;
+    }
+
+    fetch(url, fetchOptions)
+      .then(r => r.text())
+      .then(text => sendResponse({ ok: true, text }))
+      .catch(err => sendResponse({ ok: false, error: err.message || String(err) }));
+
+    return true; // keep message channel open for the async response
+  }
+
   if (msg?.type === 'START_ACTIVE_TAB') {
     chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
       const tab = tabs && tabs[0];
@@ -115,6 +156,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       .catch(() => sendResponse({ success: false }));
     return true;
   }
+
   if (msg?.type === 'GET_RUNNING' && sender.tab?.id) {
     getTabState(sender.tab.id).then((running) => sendResponse({ running }));
     return true; // async

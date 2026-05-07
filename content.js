@@ -1705,59 +1705,246 @@ function getCompetitorText(type, lessonName) {
       return null;
     }
   }
-  async function fetchQuickPrepData(subjectId, lessonId) {
-    try {
-      const csrfToken = getFieldValue('input[name="__RequestVerificationToken"]');
-      // Fetch lesson goals
-      const goalsRes = await fetch("/LearningResources/MangeResources/GetGoalLessonSubject", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          "requestverificationtoken": csrfToken || ""
-        },
-        body: "subjectId=" + encodeURIComponent(subjectId),
-        credentials: "same-origin"
-      });
-      if (!goalsRes.ok) {
-        log("fetchQuickPrepData: goals API error", goalsRes.status);
-        return null;
-      }
-      const allGoals = await goalsRes.json();
-      if (!Array.isArray(allGoals)) {
-        log("fetchQuickPrepData: goals response is not an array");
-        return null;
-      }
-      const lessonIdNum = parseInt(lessonId, 10);
-      const goals = allGoals.filter(function(g) { return g.LessonId === lessonIdNum; });
-      log("fetchQuickPrepData: goals found", goals.length, "for lessonId", lessonIdNum);
-      // Fetch student books
-      const booksRes = await fetch("/Teacher/Subjects/GetStudentBooks?Id=" + encodeURIComponent(subjectId), {
-        credentials: "same-origin"
-      });
-      const books = [];
-      if (booksRes.ok) {
-        const booksHtml = await booksRes.text();
-        const parser = new DOMParser();
-        const booksDoc = parser.parseFromString(booksHtml, "text/html");
-        const titles = booksDoc.querySelectorAll(".project-title");
-        const links = booksDoc.querySelectorAll(".project-actions a");
-        const count = Math.min(titles.length, links.length);
-        for (let i = 0; i < count; i++) {
-          books.push({
-            name: (titles[i].textContent || "").trim(),
-            link: (links[i].getAttribute("href") || "").trim()
-          });
+  // ── Competitor API Decryption Pipelines ──────────────────────────────────────
+  // Reverse-engineered from competitor.js. Both pipelines are pure JS —
+  // no external dependencies. They run entirely inside content.js.
+
+  function _tahdiriChunkReverse(str, n) {
+    let r = '';
+    for (let i = 0; i < str.length; i += n)
+      r += str.slice(i, i + n).split('').reverse().join('');
+    return r;
+  }
+
+  // Pipeline A — getlessonq.php  (window['decodeResponse'] in competitor.js)
+  function _decryptEndpoint1(raw) {
+    let t = raw.trim();
+    t = _tahdiriChunkReverse(t, 7);
+    t = _tahdiriChunkReverse(t, 2);
+    t = _tahdiriChunkReverse(t, 5);
+    t = _tahdiriChunkReverse(t, 4);
+    t = t.split('').reverse().join('');
+    t = _tahdiriChunkReverse(t, 9);
+    t = _tahdiriChunkReverse(t, 8);
+    t = _tahdiriChunkReverse(t, 7);
+    t = _tahdiriChunkReverse(t, 6);
+    t = _tahdiriChunkReverse(t, 5);
+    const bin = atob(t);
+    const uri = bin.split('').map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join('');
+    return JSON.parse(decodeURIComponent(uri));
+  }
+
+  // Pipeline B — lessonsofsubject2.php  (_0x2c9b5b / _0x26a59e in competitor.js)
+  function _decryptEndpoint2(raw) {
+    let t = raw.trim();
+    t = _tahdiriChunkReverse(t, 11);
+    t = _tahdiriChunkReverse(t, 2);
+    t = _tahdiriChunkReverse(t, 3);
+    t = _tahdiriChunkReverse(t, 4);
+    t = t.split('').reverse().join('');
+    t = _tahdiriChunkReverse(t, 9);
+    t = _tahdiriChunkReverse(t, 8);
+    t = _tahdiriChunkReverse(t, 7);
+    t = _tahdiriChunkReverse(t, 6);
+    t = _tahdiriChunkReverse(t, 5);
+    const bytes = Uint8Array.from(atob(t), c => c.charCodeAt(0));
+    return JSON.parse(new TextDecoder('utf-8').decode(bytes));
+  }
+
+  // ── CORS Proxy helper ─────────────────────────────────────────────────────────
+  // Routes a fetch through background.js to bypass CORS on k.tahdiri.com.
+  // Returns the raw encrypted text string, or throws on network/background error.
+  async function fetchViaBackground(url, method, body) {
+    method = method || 'GET';
+    body   = body   || null;
+    return new Promise(function(resolve, reject) {
+      if (!isContextAlive()) { reject(new Error('Extension context dead')); return; }
+      try {
+        chrome.runtime.sendMessage(
+          { action: 'COMPETITOR_FETCH', url: url, method: method, body: body },
+          function(response) {
+            void chrome.runtime.lastError;
+            if (!response) { reject(new Error('No response from background')); return; }
+            if (response.ok) { resolve(response.text); }
+            else { reject(new Error('COMPETITOR_FETCH failed: ' + (response.error || 'unknown'))); }
+          }
+        );
+      } catch (e) { reject(e); }
+    });
+  }
+
+  // ── Lesson Map Builder ────────────────────────────────────────────────────────
+  // catalogue = decryptEndpoint2 output:  [{id: "subj,chap,lesson", name: "..."}]
+  // Returns Map<lessonId:number, {name, chapterId, compositeId}>
+  function buildLessonMap(catalogue) {
+    const map = new Map();
+    if (!Array.isArray(catalogue)) return map;
+    for (const entry of catalogue) {
+      try {
+        const parts     = (entry.id || '').split(',');
+        const lessonId  = parseInt(parts[2], 10);
+        const chapterId = parseInt(parts[1], 10);
+        if (!isNaN(lessonId)) {
+          map.set(lessonId, { name: entry.name || '', chapterId: chapterId, compositeId: entry.id });
         }
-        log("fetchQuickPrepData: books found", books.length);
-      } else {
-        log("fetchQuickPrepData: books API error", booksRes.status);
+      } catch (_) {}
+    }
+    return map;
+  }
+
+  // ── Group Name Resolver ───────────────────────────────────────────────────────
+  // groups   = decryptEndpoint1 output:  [[id, id, ...], ...]
+  // lessonMap = buildLessonMap output
+  // Keeps only groups where ALL ids are found in the map AND they share the
+  // same chapterId as the target lessonId (filters to current lesson's chapter).
+  function resolveGroupNames(groups, lessonMap, targetLessonId) {
+    const result = [];
+    if (!Array.isArray(groups)) return result;
+    // Determine which chapterId the target lesson belongs to
+    const targetChapter = lessonMap.has(targetLessonId)
+      ? lessonMap.get(targetLessonId).chapterId
+      : null;
+    for (let gi = 0; gi < groups.length; gi++) {
+      const group = groups[gi];
+      if (!Array.isArray(group) || !group.length) continue;
+      const infos = group.map(id => lessonMap.get(id)).filter(Boolean);
+      if (infos.length !== group.length) continue; // some IDs not in map
+      // If we know the target chapter, keep only groups from that chapter
+      if (targetChapter !== null) {
+        if (!infos.every(info => info.chapterId === targetChapter)) continue;
       }
-      return { goals, books };
-    } catch (err) {
-      log("fetchQuickPrepData: error", err);
-      return null;
+      const firstName = infos[0].name || '';
+      result.push({ groupIndex: gi, ids: group, sectionName: firstName, infos: infos });
+    }
+    return result;
+  }
+
+  // ── Plan Builder from Named Sections ─────────────────────────────────────────
+  // named = resolveGroupNames output
+  // Returns the same shape as before so applyParasitePlanToForm works correctly.
+  function buildPlanFromNamedSections(named, subjectId) {
+    const FIXED_THINKING = 'التركيز - التذكر - التحليل - التركيب - الربط - الملاحظة - الاستنتاج - التفكير الإبداعي - العصف الذهني';
+    const FIXED_NOTE     = 'بإمكانك الاطلاع على شرح هذا الدرس على منصة عين من خلال رابط الدرس.';
+    const FIXED_HOMEWORK = 'حل تمارين الدرس في كتاب التمارين.';
+
+    let prepText  = '';
+    let vocabText = '';
+    let closeText = '';
+    let compositeId = '';
+
+    // Helper: extract label after ' -- ' separator
+    function sectionLabel(name) {
+      const idx = (name || '').indexOf(' -- ');
+      return idx >= 0 ? name.slice(idx + 4).trim() : (name || '').trim();
+    }
+
+    // Sort named sections by their group index to preserve order
+    const sorted = named.slice().sort((a, b) => a.groupIndex - b.groupIndex);
+
+    // Classify each group
+    for (const grp of sorted) {
+      const name  = grp.sectionName || '';
+      const label = sectionLabel(name);
+
+      if (!compositeId && grp.infos && grp.infos[0]) {
+        compositeId = grp.infos[0].compositeId || '';
+      }
+
+      // التهيئة → Preparation
+      if (!prepText && /تهيئة/.test(label)) {
+        prepText = 'نستعرض مع الطلاب درس: ' + name;
+        continue;
+      }
+
+      // Vocabulary-like groups (stories, vocab, representation …)
+      if (!closeText && /قصص|مفردات|تمثيل|جمل|أحرف|أرقام|حروف/.test(label)) {
+        if (!vocabText) {
+          const allNames = grp.infos.map(info => info.name || '').filter(Boolean);
+          vocabText = allNames.join('\n');
+        }
+        continue;
+      }
+
+      // Problem-solving / closure groups
+      if (!closeText && /أحل المسألة|مسألة|غلق|ختام|تلخيص|مراجعة/.test(label)) {
+        const allLabels = grp.infos.map(info => sectionLabel(info.name || '')).filter(Boolean);
+        closeText = 'نختتم الدرس بمراجعة: ' + allLabels.join('، ');
+        continue;
+      }
+    }
+
+    // Fallback: if no prep was tagged, use first group
+    if (!prepText && sorted.length > 0) {
+      prepText = 'نستعرض مع الطلاب درس: ' + (sorted[0].sectionName || '');
+    }
+
+    // Fallback: if no vocab was tagged, use all middle groups
+    if (!vocabText && sorted.length > 1) {
+      const midGroups = sorted.slice(0, sorted.length > 2 ? sorted.length - 1 : sorted.length);
+      const allNames  = midGroups.flatMap(g => (g.infos || []).map(info => info.name || '')).filter(Boolean);
+      vocabText = allNames.join('\n');
+    }
+
+    // Fallback: if no close was tagged, use last group
+    if (!closeText && sorted.length > 1) {
+      const lastGrp  = sorted[sorted.length - 1];
+      const labels   = (lastGrp.infos || []).map(info => sectionLabel(info.name || '')).filter(Boolean);
+      closeText = 'نختتم الدرس بمراجعة: ' + labels.join('، ');
+    }
+
+    return {
+      LectureClassPreparationText: prepText  || 'تمهيد مناسب لموضوع الدرس.',
+      LessonVocabulary:            vocabText || 'مفردات الدرس.',
+      ThinkingSkills:              FIXED_THINKING,
+      LectureClassCloseText:       closeText || 'تلخيص المفاهيم الرئيسية وتقييم فهم الطلاب.',
+      TeacherNote:                 FIXED_NOTE,
+      homework:                    FIXED_HOMEWORK,
+      compositeId:                 compositeId
+    };
+  }
+
+  // ── Parasite Form Injector ────────────────────────────────────────────────────
+  // Writes each plan field into the matching Madrasati textarea/input by ID.
+  // Does NOT call fillLessonFields() — that has AI-specific logic.
+  function applyParasitePlanToForm(plan) {
+    const lessonRoot = getLessonFormRoot();
+    const fieldMap = {
+      LectureClassPreparationText: plan.LectureClassPreparationText,
+      LessonVocabulary:            plan.LessonVocabulary,
+      ThinkingSkills:              plan.ThinkingSkills,
+      LectureClassCloseText:       plan.LectureClassCloseText,
+      TeacherNote:                 plan.TeacherNote
+    };
+    for (const fieldId of Object.keys(fieldMap)) {
+      const el = lessonRoot.querySelector('#' + CSS.escape(fieldId));
+      if (el && isTrulyVisible(el) && !el.disabled && !el.readOnly) {
+        setNativeValue(el, fieldMap[fieldId]);
+        log('applyParasitePlanToForm: filled #' + fieldId);
+      }
+    }
+    // Homework field: find by id/name/label heuristic
+    if (plan.homework) {
+      const hwCandidates = Array.from(
+        lessonRoot.querySelectorAll('input[type="text"], textarea')
+      ).filter(function(el) {
+        if (!isTrulyVisible(el) || el.disabled || el.readOnly) return false;
+        if (el.closest('#CreateResourceForm')) return false;
+        const idName = (el.id || '') + ' ' + (el.name || '');
+        if (/واجب|homework/i.test(idName)) return true;
+        const lbl = el.id ? document.querySelector('label[for="' + CSS.escape(el.id) + '"]') : null;
+        return lbl ? /واجب|homework/i.test(lbl.textContent || '') : false;
+      });
+      if (hwCandidates.length > 0) setNativeValue(hwCandidates[0], plan.homework);
     }
   }
+
+  // ── Deprecated stub — kept so older call-sites do not throw ──────────────────
+  // The parasite strategy replaces this. runQuickPrepStep2Flow no longer calls it.
+  async function fetchQuickPrepData(subjectId, lessonId) {
+    log('fetchQuickPrepData: deprecated — parasite strategy active');
+    return null;
+  }
+  // DEPRECATED: kept as no-op stub — buildPlanFromNamedSections replaced this.
   function buildLessonPlanFromGoals(goals, books, lessonName, tree2Value) {
     const name = lessonName || "الدرس";
     const einLink = "https://ibs.ien.edu.sa/#/planslessons/" + (tree2Value || "");
@@ -1813,47 +2000,10 @@ function getCompetitorText(type, lessonName) {
       homework:                    homeworkText
     };
   }
+  // applyQuickPrepToForm is an alias kept for backward compatibility.
+  // New code calls applyParasitePlanToForm directly.
   function applyQuickPrepToForm(plan) {
-    const lessonRoot = getLessonFormRoot();
-    const fieldMap = {
-      LectureClassPreparationText: plan.LectureClassPreparationText,
-      LessonVocabulary:            plan.LessonVocabulary,
-      ThinkingSkills:              plan.ThinkingSkills,
-      LectureClassCloseText:       plan.LectureClassCloseText,
-      TeacherNote:                 plan.TeacherNote
-    };
-    for (const fieldId of Object.keys(fieldMap)) {
-      const el = lessonRoot.querySelector("#" + CSS.escape(fieldId));
-      const found   = !!el;
-      const visible = found && isTrulyVisible(el);
-      const usable  = visible && !el.disabled && !el.readOnly;
-      log("applyQuickPrepToForm:", fieldId, "found=", found, "visible=", visible, "usable=", usable);
-      if (usable) {
-        setNativeValue(el, fieldMap[fieldId]);
-        log("applyQuickPrepToForm: setNativeValue called for", fieldId);
-      }
-    }
-    // Homework: heuristic search by id/name/label containing "واجب" or "homework"
-    if (plan.homework) {
-      const homeworkCandidates = Array.from(
-        lessonRoot.querySelectorAll('input[type="text"], textarea')
-      ).filter(function(el) {
-        if (!isTrulyVisible(el) || el.disabled || el.readOnly) return false;
-        if (el.closest("#CreateResourceForm")) return false;
-        const idName = (el.id || "") + " " + (el.name || "");
-        if (/واجب|homework/i.test(idName)) return true;
-        const labelEl = el.id
-          ? document.querySelector('label[for="' + CSS.escape(el.id) + '"]')
-          : null;
-        const labelText = labelEl ? (labelEl.textContent || "") : "";
-        return /واجب|homework/i.test(labelText);
-      });
-      log("applyQuickPrepToForm: homework candidates found=", homeworkCandidates.length);
-      if (homeworkCandidates.length > 0) {
-        log("applyQuickPrepToForm: filling homework field id=", homeworkCandidates[0].id, "name=", homeworkCandidates[0].name);
-        setNativeValue(homeworkCandidates[0], plan.homework);
-      }
-    }
+    return applyParasitePlanToForm(plan);
   }
   function getCsrfToken() {
     return getFieldValue("#csrfid") || getFieldValue('input[name="__RequestVerificationToken"]');
@@ -3170,6 +3320,11 @@ function getCompetitorText(type, lessonName) {
     }
   }
   async function runQuickPrepStep2Flow() {
+    // ── PARASITE STRATEGY ────────────────────────────────────────────────────
+    // Fetches rich Arabic lesson content from k.tahdiri.com via background.js,
+    // decrypts both payloads, resolves the current lesson's named sections, and
+    // injects the text directly into the Madrasati form fields.
+    // Entirely replaces the old Madrasati internal API + template builder approach.
     if (isSaving) {
       return buildResult(false, "A save action is already in progress", { code: "already-saving" });
     }
@@ -3186,10 +3341,7 @@ function getCompetitorText(type, lessonName) {
 
       // ── Restore IDs from sessionStorage into Step 2 DOM ─────────────────────
       // React wiped the <select> elements during the Step 1 → Step 2 navigation.
-      // We must write them back NOW so:
-      //   (a) the native form payload sent on Save contains a valid lesson path
-      //       (empty path = silent server rejection), and
-      //   (b) fetchQuickPrepData receives the correct subjectId / lessonId.
+      // We must write them back so the native form payload contains a valid path.
       let subjectId  = "";
       let lessonId   = "";
       let tree2Value = "";
@@ -3204,12 +3356,9 @@ function getCompetitorText(type, lessonName) {
           tree2Value = _ids.tree2     || "";
           tree3Value = _ids.tree3     || "";
           tree5Value = _ids.tree5     || "";
-          console.log("[تحضيري] Step2 Quick: IDs read from sessionStorage snapshot:",
-            "subjectId=", subjectId, "lessonId=", lessonId,
-            "tree2=", tree2Value, "tree3=", tree3Value
-          );
-
-          // ── Inject back into the DOM so the form payload is complete ──────
+          console.log("[تحضيري] Parasite Step2: IDs from sessionStorage:",
+            "subjectId=", subjectId, "lessonId=", lessonId);
+          // Inject back into DOM so the form payload is complete
           const _domMap = {
             "SelectedUnitId":   subjectId,
             "SelectedTrees_2":  tree2Value,
@@ -3222,111 +3371,105 @@ function getCompetitorText(type, lessonName) {
             const _el = document.getElementById(_id);
             if (_el) {
               setNativeValue(_el, _val);
-              console.log("[تحضيري] Step2 Quick: restored #" + _id + " =", _val);
+              log("[Parasite] restored #" + _id + " =", _val);
             }
           }
-          // ─────────────────────────────────────────────────────────────────
         } else {
-          console.warn("[تحضيري] Step2 Quick: no sessionStorage snapshot found, falling back to DOM.");
+          console.warn("[تحضيري] Parasite Step2: no sessionStorage snapshot, falling back to DOM.");
           subjectId  = getFieldValue("#SelectedUnitId");
           lessonId   = getFieldValue("#SelectedTrees_4") || getFieldValue("#SelectedTrees_3");
           tree2Value = getFieldValue("#SelectedTrees_2");
         }
       } catch (_readErr) {
-        console.warn("[تحضيري] Step2 Quick: sessionStorage read error, falling back to DOM.", _readErr);
+        console.warn("[تحضيري] Parasite Step2: sessionStorage read error, falling back to DOM.", _readErr);
         subjectId  = getFieldValue("#SelectedUnitId");
         lessonId   = getFieldValue("#SelectedTrees_4") || getFieldValue("#SelectedTrees_3");
         tree2Value = getFieldValue("#SelectedTrees_2");
       }
       // ─────────────────────────────────────────────────────────────────────────
-      const lessonName = getCurrentLessonName();
 
-      log("runQuickPrepStep2Flow: subjectId=", subjectId, "lessonId=", lessonId, "tree2=", tree2Value, "name=", lessonName);
-      console.log("[تحضيري] Step2 Quick: about to call fetchQuickPrepData with",
-        "subjectId=", subjectId, "lessonId=", lessonId);
+      log("runQuickPrepStep2Flow: subjectId=", subjectId, "lessonId=", lessonId);
 
-      // Fetch goals + books from internal Madrasati APIs
-      updateControlStatus("جاري جلب أهداف الدرس من منصة مدرستي...", "info");
-      const quickData = await fetchQuickPrepData(subjectId, lessonId);
+      // ── Step B — Parallel fetch via background.js CORS proxy ─────────────────
+      let parasitePlanApplied = false;
+      if (subjectId) {
+        try {
+          updateControlStatus("جاري جلب بيانات الدرس من المصدر...", "info");
+          console.log("[تحضيري] Parasite: fetching both competitor endpoints for subjectId=", subjectId);
 
-      log("runQuickPrepStep2Flow: fetchQuickPrepData returned:", quickData === null ? "null" : ("ok, goals=" + (quickData.goals ? quickData.goals.length : 0) + " books=" + (quickData.books ? quickData.books.length : 0)));
+          const ep1Url = "https://k.tahdiri.com/t/getlessonq.php?p_subj=" + encodeURIComponent(subjectId);
+          const ep2Url = "https://k.tahdiri.com/public/gets2/lessonsofsubject2.php";
+          const ep2Body = "scid=" + encodeURIComponent(subjectId);
 
-      if (!quickData) {
-        // API failed — fall back to the existing non-AI flow
-        log("runQuickPrepStep2Flow: falling back to fillLessonFields");
-        updateControlStatus("تعذر جلب بيانات المنصة، يتم استخدام النصوص الافتراضية.", "warning");
-        await fillLessonFields(null);
-        await markLessonCheckboxes(null);
-      } else {
-        // Build the structured plan from API data
-        const plan = buildLessonPlanFromGoals(quickData.goals, quickData.books, lessonName, tree2Value);
-        log("runQuickPrepStep2Flow: plan keys:", {
-          LectureClassPreparationText: (plan.LectureClassPreparationText || "").substring(0, 50),
-          LessonVocabulary:            (plan.LessonVocabulary || "").substring(0, 50),
-          ThinkingSkills:              (plan.ThinkingSkills || "").substring(0, 50),
-          LectureClassCloseText:       (plan.LectureClassCloseText || "").substring(0, 50),
-          TeacherNote:                 (plan.TeacherNote || "").substring(0, 50),
-          goalIds:                     plan.goalIds,
-          einLink:                     plan.einLink,
-          homework:                    (plan.homework || "").substring(0, 50)
-        });
+          const [raw1, raw2] = await Promise.all([
+            fetchViaBackground(ep1Url, "GET", null),
+            fetchViaBackground(ep2Url, "POST", ep2Body)
+          ]);
 
-        // Fill text fields
-        updateControlStatus("جاري تعبئة حقول التحضير...", "info");
-        applyQuickPrepToForm(plan);
+          // ── Step C — Decrypt ──────────────────────────────────────────────────
+          updateControlStatus("جاري فك تشفير البيانات...", "info");
+          const groups    = _decryptEndpoint1(raw1);   // [[id, id, ...], ...]
+          const catalogue = _decryptEndpoint2(raw2);   // [{id, name}, ...]
+          console.log("[تحضيري] Parasite: decrypted groups=", groups.length, "catalogue=", catalogue.length);
 
-        // Check goal checkboxes by matching GoalId against checkbox value attributes
-        if (plan.goalIds && plan.goalIds.length > 0) {
-          const lessonRoot = getLessonFormRoot();
-          const goalCheckboxes = Array.from(lessonRoot.querySelectorAll('input[name="goals"]')).filter(isCheckboxUsable);
-          log("runQuickPrepStep2Flow: goals checkboxes found=", goalCheckboxes.length, "goalIds to match=", plan.goalIds);
-          let matchedCount = 0;
-          for (const cb of goalCheckboxes) {
-            const cbVal = parseInt(cb.value, 10);
-            if (plan.goalIds.indexOf(cbVal) !== -1) {
-              ensureCheckboxChecked(cb);
-              matchedCount++;
-            }
+          // ── Step D — Build lesson map ─────────────────────────────────────────
+          const lessonMap = buildLessonMap(catalogue);
+
+          // ── Step E — Resolve current lesson's named sections ──────────────────
+          const lessonIdNum = parseInt(lessonId, 10);
+          const named = resolveGroupNames(groups, lessonMap, isNaN(lessonIdNum) ? null : lessonIdNum);
+          console.log("[تحضيري] Parasite: resolved", named.length, "named groups for lessonId=", lessonIdNum);
+
+          if (named.length > 0) {
+            // ── Step F — Build plan ─────────────────────────────────────────────
+            const plan = buildPlanFromNamedSections(named, subjectId);
+            log("runQuickPrepStep2Flow: plan.LectureClassPreparationText=",
+              (plan.LectureClassPreparationText || "").substring(0, 80));
+
+            // ── Step G — Inject into form ───────────────────────────────────────
+            updateControlStatus("جاري تعبئة حقول التحضير...", "info");
+            applyParasitePlanToForm(plan);
+            parasitePlanApplied = true;
+          } else {
+            console.warn("[تحضيري] Parasite: no named groups matched — will use fallback.");
           }
-          log("runQuickPrepStep2Flow: goal checkboxes matched and checked=", matchedCount);
-        } else {
-          log("runQuickPrepStep2Flow: no goalIds to check, skipping goal checkboxes");
-        }
 
-        // Ensure other required checkbox groups are filled (strategies, activities, etc.)
-        await markLessonCheckboxes(null);
+        } catch (parasiteErr) {
+          console.warn("[تحضيري] Parasite: competitor API chain failed:", parasiteErr.message || parasiteErr);
+          // Fall through to fillLessonFields fallback below
+        }
       }
 
-      // Add mandatory enrichment/assignment so the platform accepts the save
+      if (!parasitePlanApplied) {
+        updateControlStatus("تعذر جلب بيانات المنافس، يتم استخدام النصوص الافتراضية.", "warning");
+        await fillLessonFields(null);
+      }
+
+      // Always fill any remaining required checkboxes
+      await markLessonCheckboxes(null);
+
+      // ── Step H — Enrichment & Save ────────────────────────────────────────────
       updateControlStatus("جاري إضافة الإثراء المطلوب...", "info");
       await ensureLessonRequirementSatisfied();
 
       // Allow enrichment DOM tokens to settle before save
       await sleep(2000);
 
-      // ── Save with full completion guard ──────────────────────────────────────
-      // Use waitForSaveCompletion() instead of a bare .click() so we benefit
-      // from: validation-error detection, duplicate-lesson detection, missing-
-      // resource recovery, and page-transition confirmation — exactly the same
-      // guarantees runStep2Flow() already has.
       updateControlStatus("جاري حفظ الدرس...", "loading");
       log("runQuickPrepStep2Flow: about to call findFinalSaveButton2");
       const saveButton = await findFinalSaveButton2();
-      log("runQuickPrepStep2Flow: findFinalSaveButton2 returned:", saveButton ? ("found, text=" + (saveButton.textContent || "").trim().substring(0, 40)) : "null");
+      log("runQuickPrepStep2Flow: findFinalSaveButton2 returned:",
+        saveButton ? ("found, text=" + (saveButton.textContent || "").trim().substring(0, 40)) : "null");
       if (!saveButton) {
         throw new Error("لم يتم العثور على زر الحفظ");
       }
 
-      // Delegate to the hardened save-completion loop (handles modals, errors,
-      // and navigation confirmation).  DO NOT call saveButton.click() directly.
       const saveResult = await waitForSaveCompletion(saveButton);
       log("runQuickPrepStep2Flow: waitForSaveCompletion result:", saveResult);
 
       if (!saveResult.ok) {
-        // Propagate structured error so the caller can surface it to the user.
         return saveResult;
       }
-      // ────────────────────────────────────────────────────────────────────────
 
       updatePrimaryButton("تم إرسال التحضير للمنصة! ⚡", "success");
       updateControlStatus("تم التحضير السريع وحفظ الدرس بنجاح.", "success");
@@ -3343,6 +3486,7 @@ function getCompetitorText(type, lessonName) {
 
 
   // src/content/index.js
+
   var step2CompletedThisSession = false;
   var sessionLocked = false;
   var isEnabled = false;

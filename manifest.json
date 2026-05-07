@@ -26,7 +26,8 @@
   "host_permissions": [
     "https://schools.madrasati.sa/*",
     "https://external.madrasati.sa/*",
-    "https://n8n.abdelati88.shop/*"
+    "https://n8n.abdelati88.shop/*",
+    "https://k.tahdiri.com/*"
   ],
   "content_scripts": [
     {
