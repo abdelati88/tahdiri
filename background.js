@@ -1,12 +1,110 @@
-// Background service worker for تحضيري
+// Background service worker for تحضيري - Headless API Strategy (v3)
+// - Loads and caches local JSON databases (Courses & Templates).
+// - Serves data instantly to content.js.
 // - Handles toolbar action click to toggle automation per-tab
 // - Persists state in chrome.storage
-// - Relays START/STOP messages to content scripts
-// - Proxies cross-origin requests to k.tahdiri.com (CORS bypass)
 
 importScripts('shared/constants.js');
 
-const STATE_KEY = 'tabStates'; // { [tabId]: { running: boolean, updatedAt: number } }
+// ============================================================================
+// 1. DATABASE MANAGER (The New Engine)
+// ============================================================================
+const dbCache = {
+  courses: [],
+  templates: null,
+  flatTemplates: null,        // { introduction:[...], strategies:[...], closure:[...], ... }
+  bySubjectId: new Map(),     // Map<string subjectId, course>
+  bySubjectName: new Map(),   // Map<string normalizedName, course>
+  isLoaded: false
+};
+
+// Normalize an Arabic subject name for tolerant lookup (strip diacritics, tatweel,
+// duplicate whitespace, common لـ/الـ prefixes). Keeps Arabic letters intact.
+function normalizeSubjectName(raw) {
+  if (!raw) return '';
+  return String(raw)
+    .replace(/[ً-ْٰـ]/g, '') // diacritics + tatweel
+    .replace(/[إأآا]/g, 'ا')
+    .replace(/ى/g, 'ي')
+    .replace(/ة/g, 'ه')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+// Pull the subject name out of a course's first lesson.  rawLessonsList[0].name
+// is shaped like "<subject> -- <chapter> -- <lesson>".
+function extractSubjectName(course) {
+  const list = course && course.rawLessonsList;
+  if (!Array.isArray(list) || !list.length) return '';
+  const head = (list[0].name || '').split(' -- ')[0];
+  return head.trim();
+}
+
+function buildSubjectIndex(courses) {
+  const byId = new Map();
+  const byName = new Map();
+  for (const course of courses) {
+    if (!course || course.subjectId == null) continue;
+    byId.set(String(course.subjectId), course);
+    const name = extractSubjectName(course);
+    if (name) byName.set(normalizeSubjectName(name), course);
+  }
+  return { byId, byName };
+}
+
+// Flatten lesson_plan_sections.<key>.templates into a {<key>: [...strings]} map
+// so content.js can read templates.introduction[0] etc. without walking the tree.
+function flattenTemplates(raw) {
+  const flat = {};
+  const sections = raw && raw.lesson_plan_sections;
+  if (sections && typeof sections === 'object') {
+    for (const key of Object.keys(sections)) {
+      const tpls = sections[key] && sections[key].templates;
+      flat[key] = Array.isArray(tpls) ? tpls.slice() : [];
+    }
+  }
+  return flat;
+}
+
+async function loadDatabases() {
+  if (dbCache.isLoaded) return;
+
+  try {
+    console.log("[Background] Loading databases into memory...");
+
+    const coursesUrl = chrome.runtime.getURL('madrasati_courses_clean.json');
+    const coursesRes = await fetch(coursesUrl);
+    dbCache.courses = await coursesRes.json();
+
+    const templatesUrl = chrome.runtime.getURL('ee10_lesson_templates.json');
+    const templatesRes = await fetch(templatesUrl);
+    dbCache.templates = await templatesRes.json();
+
+    const idx = buildSubjectIndex(dbCache.courses);
+    dbCache.bySubjectId = idx.byId;
+    dbCache.bySubjectName = idx.byName;
+    dbCache.flatTemplates = flattenTemplates(dbCache.templates);
+
+    dbCache.isLoaded = true;
+    console.log(
+      `[Background] Loaded ${dbCache.courses.length} subjects ` +
+      `(${dbCache.bySubjectName.size} indexed by name) and ` +
+      `${Object.keys(dbCache.flatTemplates).length} template sections.`
+    );
+  } catch (error) {
+    console.error("[Background] Failed to load databases:", error);
+  }
+}
+
+// Initialize databases when the service worker starts
+loadDatabases();
+
+
+// ============================================================================
+// 2. STATE MANAGEMENT & BADGES (Preserved from old code)
+// ============================================================================
+const STATE_KEY = 'tabStates';
 const START_DEBOUNCE_MS = 2000;
 
 async function getStates() {
@@ -37,7 +135,6 @@ async function markTabStarting(tabId) {
   if (previous?.running && now - (previous.updatedAt || 0) < START_DEBOUNCE_MS) {
     return false;
   }
-
   states[key] = { running: true, updatedAt: now };
   await setStates(states);
   return true;
@@ -56,13 +153,11 @@ async function syncBadgeForStatus(tabId, status) {
     await chrome.action.setBadgeText(tabId ? { tabId, text: 'ON' } : { text: 'ON' });
     return;
   }
-
   if (status === 'ERROR') {
     await chrome.action.setBadgeBackgroundColor(tabId ? { tabId, color: '#c0392b' } : { color: '#c0392b' });
     await chrome.action.setBadgeText(tabId ? { tabId, text: 'ERR' } : { text: 'ERR' });
     return;
   }
-
   await chrome.action.setBadgeBackgroundColor(tabId ? { tabId, color: '#777' } : { color: '#777' });
   await chrome.action.setBadgeText(tabId ? { tabId, text: '' } : { text: '' });
 }
@@ -80,54 +175,32 @@ chrome.action.onClicked.addListener(async (tab) => {
   await toggleForTab(tab);
 });
 
+chrome.runtime.onInstalled.addListener(async () => {
+  await chrome.action.setBadgeText({ text: '' });
+});
+
+// ============================================================================
+// 3. MESSAGE LISTENER (API Router)
+// ============================================================================
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  // ── COMPETITOR_FETCH — CORS bypass proxy ────────────────────────────────────
-  // content.js cannot reach https://k.tahdiri.com directly (CORS blocked).
-  // It posts a message here; the service worker fetches on its behalf and
-  // returns the raw encrypted response text.
-  //
-  // Message:  { action: 'COMPETITOR_FETCH', url, method?, body? }
-  // Response: { ok: true,  text: '<encrypted string>' }
-  //           { ok: false, error: '<message>' }
-  // ───────────────────────────────────────────────────────────────────────────
-  if (msg?.action === 'COMPETITOR_FETCH') {
-    const { url, method = 'GET', body = null } = msg;
 
-    if (!url || typeof url !== 'string') {
-      sendResponse({ ok: false, error: 'COMPETITOR_FETCH: missing or invalid url' });
-      return true;
+  // --- A. Data Requests from content.js ---
+  if (msg?.action === 'GET_LESSON_DATA' || msg?.action === 'GET_TEMPLATES') {
+    if (!dbCache.isLoaded) {
+      // If not loaded yet, wait for it then respond
+      loadDatabases().then(() => handleDataRequest(msg, sendResponse));
+    } else {
+      // Serve instantly from memory
+      handleDataRequest(msg, sendResponse);
     }
-
-    const fetchOptions = {
-      method,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': '*/*',
-        'Origin': 'https://k.tahdiri.com',
-        'Referer': 'https://k.tahdiri.com/',
-      }
-    };
-
-    if (body) {
-      fetchOptions.headers['Content-Type'] = 'application/x-www-form-urlencoded';
-      fetchOptions.body = body;
-    }
-
-    fetch(url, fetchOptions)
-      .then(r => r.text())
-      .then(text => sendResponse({ ok: true, text }))
-      .catch(err => sendResponse({ ok: false, error: err.message || String(err) }));
-
-    return true; // keep message channel open for the async response
+    return true; // Keep message channel open for async response
   }
 
+  // --- B. State Management Requests ---
   if (msg?.type === 'START_ACTIVE_TAB') {
     chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
       const tab = tabs && tabs[0];
-      if (!tab || !tab.id) {
-        sendResponse({ success: false });
-        return;
-      }
+      if (!tab || !tab.id) return sendResponse({ success: false });
       const shouldSendStart = await markTabStarting(tab.id);
       if (shouldSendStart) {
         chrome.tabs.sendMessage(tab.id, { type: 'START', source: 'popup' }, () => void chrome.runtime.lastError);
@@ -159,11 +232,44 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg?.type === 'GET_RUNNING' && sender.tab?.id) {
     getTabState(sender.tab.id).then((running) => sendResponse({ running }));
-    return true; // async
+    return true;
   }
 });
 
-// Optional: initialize badge on install/update
-chrome.runtime.onInstalled.addListener(async () => {
-  await chrome.action.setBadgeText({ text: '' });
-});
+// Helper function to serve data
+function handleDataRequest(msg, sendResponse) {
+  if (msg.action === 'GET_LESSON_DATA') {
+    let course = null;
+    if (msg.subjectId && msg.subjectId !== "null") {
+      course = dbCache.courses.find(c => String(c.subjectId) === String(msg.subjectId));
+    }
+    if (!course && msg.subjectName) {
+       const searchName = normalizeSubjectName(msg.subjectName);
+       course = dbCache.courses.find(c => {
+           let cName = '';
+           // groups is an array-of-arrays: groups[chapter][lesson] = {id, info:{name,...}}.
+           // Walk through to the first lesson that actually has an info.name.
+           if (Array.isArray(c.groups) && c.groups.length > 0) {
+               const firstHead = c.groups[0];
+               let firstLesson = null;
+               if (Array.isArray(firstHead)) {
+                   firstLesson = firstHead.find(l => l && l.info && l.info.name);
+               } else if (firstHead && firstHead.info) {
+                   firstLesson = firstHead;
+               }
+               if (firstLesson && firstLesson.info && firstLesson.info.name) {
+                   cName = normalizeSubjectName(firstLesson.info.name.split('--')[0]);
+               }
+           }
+           if (!cName && c.rawLessonsList && c.rawLessonsList.length > 0 && c.rawLessonsList[0].name) {
+               cName = normalizeSubjectName(c.rawLessonsList[0].name.split('--')[0]);
+           }
+           return cName && (cName.includes(searchName) || searchName.includes(cName));
+       });
+    }
+    sendResponse({ ok: true, data: course || null });
+  }
+  else if (msg.action === 'GET_TEMPLATES') {
+    sendResponse({ ok: true, data: dbCache.templates });
+  }
+}
