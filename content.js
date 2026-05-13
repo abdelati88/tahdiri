@@ -1311,7 +1311,9 @@
       payload.append("TypeId", "1");
       payload.append("__RequestVerificationToken", token);
       payload.append("HashKey", hashKey);
-      payload.append("Id", "0");
+      // Verified from competitor's working trace: Id is sent as EMPTY STRING.
+      // ARCHITECTURE.md §4.3 incorrectly says "0" — that value is silently rejected.
+      payload.append("Id", "");
       payload.append("schoolId", schoolId);
       payload.append("SelectedUnitId", subjectId);
       payload.append("SelectedTrees_2", chapterId);
@@ -1319,7 +1321,10 @@
       payload.append("Name", `نشاط (${lessonName})`);
       payload.append("CategoryId", "4");
       payload.append("ClassificationLevel", "1");
+      // Verified from competitor's working trace: ProjectType is sent TWICE —
+      // first as "2", then as empty string. Single occurrence may be silently rejected.
       payload.append("ProjectType", "2");
+      payload.append("ProjectType", "");
       payload.append("Description", "نشاط تدريبي داعم لموضوع الدرس");
       payload.append("Link", "https://ien.edu.sa");
       payload.append("SolvingType", "3");
@@ -1340,12 +1345,147 @@
           body: payload.toString()
         });
         console.log("[Tahdiri] Activity POST response — status:", saveRes.status, "url:", saveRes.url);
-        return saveRes.ok;
+        if (!saveRes.ok) return false;
+        return true;
       } catch (e) {
         console.error("[Tahdiri] Failed to POST silent Activity", e);
         return false;
       }
     }
+
+    function _sanitizeFilename(str) {
+      if (!str) return "lesson";
+      return String(str)
+        .replace(/[\\\/:*?"<>|]/g, "_")
+        .replace(/\s+/g, "_")
+        .replace(/_{2,}/g, "_")
+        .slice(0, 120);
+    }
+
+    async function bulkDownloadAllLecturePDFs(opts) {
+      opts = opts || {};
+      const delayMs = typeof opts.delayMs === "number" ? opts.delayMs : 1200;
+      const onlyPrepared = opts.onlyPrepared !== false; // default true
+
+      const cards = Array.from(document.querySelectorAll("div.cs-lesson-card"));
+      if (!cards.length) {
+        console.warn("[Tahdiri-Bulk] No .cs-lesson-card elements found on the page.");
+        return { ok: false, reason: "no_cards" };
+      }
+
+      const csrf = (typeof getCsrfToken === "function") ? getCsrfToken() : "";
+      console.log("[Tahdiri-Bulk] Found " + cards.length + " cards. CSRF len=" + (csrf || "").length);
+
+      const results = [];
+      let idx = 0;
+
+      for (const card of cards) {
+        idx++;
+        let token = card.getAttribute("data-data");
+        if (!token) {
+          const elWithToken = card.querySelector("[data-data]");
+          if (elWithToken) {
+            token = elWithToken.getAttribute("data-data");
+          }
+        }
+        const isPrepared = card.querySelector(".schedule-card.done") || card.classList.contains("tahdiri-processed");
+
+        if (onlyPrepared && !isPrepared) {
+          console.log("[Tahdiri-Bulk] [" + idx + "/" + cards.length + "] SKIP (not prepared / blue card)");
+          results.push({ idx: idx, status: "skipped_blue" });
+          continue;
+        }
+        if (!token || token.length < 16) {
+          console.log("[Tahdiri-Bulk] [" + idx + "/" + cards.length + "] SKIP (no data-data token)");
+          results.push({ idx: idx, status: "skipped_no_token" });
+          continue;
+        }
+
+        // Try to build a meaningful filename from DOM
+        const subjectEl = card.querySelector("h2, .title h2, .title");
+        const gradeEl = card.querySelector("small");
+        const cell = card.closest("td");
+        const rowTh = cell ? (cell.parentElement && cell.parentElement.querySelector("th")) : null;
+        const dayLabel = rowTh ? rowTh.textContent.trim() : "";
+        const headerCells = cell && cell.parentElement && cell.parentElement.parentElement
+          ? cell.parentElement.parentElement.querySelector("tr")
+          : null;
+        let slotLabel = "";
+        if (cell && headerCells) {
+          const tds = Array.from(cell.parentElement.children);
+          const colIdx = tds.indexOf(cell);
+          const ths = headerCells.querySelectorAll("th");
+          if (colIdx >= 0 && ths[colIdx]) slotLabel = ths[colIdx].textContent.trim();
+        }
+
+        const subject = subjectEl ? subjectEl.textContent.trim() : "subject";
+        const grade = gradeEl ? gradeEl.textContent.trim() : "";
+        const fnameRaw = [dayLabel, slotLabel, subject, grade].filter(Boolean).join("_");
+        const fname = _sanitizeFilename(fnameRaw) + "__" + idx + ".pdf";
+
+        try {
+          console.log("[Tahdiri-Bulk] [" + idx + "/" + cards.length + "] POST PrintLecture — " + fname);
+          const body = new URLSearchParams();
+          body.append("Data", token);
+
+          const headers = {
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest"
+          };
+          if (csrf) headers["requestverificationtoken"] = csrf;
+
+          const res = await fetch("/Teacher/Lessons/PrintLecture", {
+            method: "POST",
+            credentials: "same-origin",
+            headers: headers,
+            body: body.toString()
+          });
+
+          if (!res.ok) {
+            console.warn("[Tahdiri-Bulk] [" + idx + "] HTTP " + res.status + " — " + res.url);
+            results.push({ idx: idx, status: "http_error", code: res.status, fname: fname });
+            await new Promise(r => setTimeout(r, delayMs));
+            continue;
+          }
+
+          const ctype = res.headers.get("content-type") || "";
+          const blob = await res.blob();
+
+          if (!/pdf/i.test(ctype) && blob.size < 2000) {
+            const text = await blob.text();
+            console.warn("[Tahdiri-Bulk] [" + idx + "] non-PDF response (ctype=" + ctype + ", size=" + blob.size + "). Snippet:", text.slice(0, 200));
+            results.push({ idx: idx, status: "not_pdf", ctype: ctype, size: blob.size, fname: fname });
+            await new Promise(r => setTimeout(r, delayMs));
+            continue;
+          }
+
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = fname;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          setTimeout(() => URL.revokeObjectURL(url), 5000);
+
+          console.log("[Tahdiri-Bulk] [" + idx + "] ✓ saved " + fname + " (" + blob.size + " bytes)");
+          results.push({ idx: idx, status: "ok", size: blob.size, fname: fname });
+        } catch (e) {
+          console.error("[Tahdiri-Bulk] [" + idx + "] EXCEPTION", e);
+          results.push({ idx: idx, status: "exception", error: String(e) });
+        }
+
+        await new Promise(r => setTimeout(r, delayMs));
+      }
+
+      console.table(results);
+      const okCount = results.filter(r => r.status === "ok").length;
+      console.log("[Tahdiri-Bulk] DONE — " + okCount + "/" + cards.length + " PDFs downloaded.");
+      return { ok: true, total: cards.length, downloaded: okCount, results: results };
+    }
+
+    // Expose for manual invocation from DevTools console
+    window.bulkDownloadAllLecturePDFs = bulkDownloadAllLecturePDFs;
 
     async function silentPrepareLesson(token, selection, passedSubjectId, realSchoolId, lessonCardDiv) {
       const ids = selection.treeValue.split(',');
@@ -1385,13 +1525,94 @@
 
       // 2. Create the Activity FIRST — before any ManageLecture fetch that could invalidate the HashKey
       const activityCreated = await silentCreateActivityResource(treeSubjectId, chapterId, lessonId, lessonName, realSchoolId, null);
+      console.log('[Tahdiri] Activity created:', activityCreated);
 
       if (!activityCreated) {
         console.error("[Tahdiri] Activity creation failed - aborting lesson save.");
         return false;
       }
 
-      // 3. NOW fetch ManageLecture for the SaveLastLessonPlan CSRF (after Activity is safely created)
+      // 3a. Call MlutiLessonPlan to get NUMERIC SchoolId + TimeTableId for SaveLastLessonPlan.
+      // The `token` is the card's `data-data` encrypted blob. Posting it to MlutiLessonPlan
+      // returns a server-rendered form with all the numeric IDs SaveLastLessonPlan requires.
+      let mlutiFormData = null;
+      const looksLikeBlob = (v) => {
+        if (!v) return false;
+        const s = String(v).trim();
+        if (/^\d{1,5}$/.test(s)) return false; // slot index, not a blob
+        return s.length >= 16;
+      };
+      if (looksLikeBlob(token)) {
+        try {
+          const mlutiCsrf = getCsrfToken();
+          const mlutiBody = new URLSearchParams();
+          mlutiBody.append('Data', token);
+          const mlutiRes = await fetch('/Teacher/Lessons/MlutiLessonPlan', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+              'X-Requested-With': 'XMLHttpRequest',
+              'requestverificationtoken': mlutiCsrf
+            },
+            body: mlutiBody.toString()
+          });
+          const mlutiHtml = await mlutiRes.text();
+          const mlutiDoc = new DOMParser().parseFromString(mlutiHtml, 'text/html');
+          const mlutiInputs = mlutiDoc.querySelectorAll('input[type="hidden"]');
+          if (mlutiInputs.length > 3) {
+            mlutiFormData = new FormData();
+            mlutiInputs.forEach(inp => { if (inp.name) mlutiFormData.set(inp.name, inp.value); });
+            console.log('[Tahdiri] MlutiLessonPlan OK — SchoolId:', mlutiFormData.get('SchoolId'), 'TimeTableId:', mlutiFormData.get('TimeTableId'), 'fields:', mlutiInputs.length);
+          } else {
+            console.warn('[Tahdiri] MlutiLessonPlan returned too few hidden inputs:', mlutiInputs.length, '— snippet:', mlutiHtml.slice(0, 200));
+          }
+        } catch (e) {
+          console.warn('[Tahdiri] MlutiLessonPlan fetch failed:', e);
+        }
+      } else {
+        console.warn('[Tahdiri] token is not a blob — skipping MlutiLessonPlan. token:', String(token || '').slice(0, 20));
+      }
+
+      // 3b. Fetch the Activity's ProjectId by scraping /Projects/Projects/Index/{schoolId}
+      // The JSON endpoint /Teacher/LectureTools/GetProjectsList returns 500 (broken).
+      // The HTML page /Projects/Projects/Index/{schoolId} lists all projects for the school;
+      // we parse the latest ProjectId from data-id attributes or /Edit/{id} URLs.
+      let activityProjectId = '';
+      try {
+        const indexUrl = `/Projects/Projects/Index/${encodeURIComponent(realSchoolId)}?hfLevelsCount=3`;
+        const projRes = await fetch(indexUrl, { credentials: 'same-origin' });
+        if (projRes.ok) {
+          const html = await projRes.text();
+          // Match patterns the Madrasati Projects/Index page uses to render each row.
+          // Capture ALL ids on the page and take the largest (most recently created).
+          const idCandidates = new Set();
+          const patterns = [
+            /data-id=["'](\d{5,12})["']/g,
+            /\/Projects\/Projects\/Edit\/(\d{5,12})/g,
+            /\/Projects\/Projects\/Delete\/(\d{5,12})/g,
+            /ProjectId["']?\s*[:=]\s*["']?(\d{5,12})/g
+          ];
+          for (const re of patterns) {
+            let m;
+            while ((m = re.exec(html)) !== null) idCandidates.add(m[1]);
+          }
+          if (idCandidates.size > 0) {
+            // Most recently created project has the highest numeric ID (auto-increment PK).
+            const sorted = [...idCandidates].map(s => BigInt(s)).sort((a, b) => (a > b ? -1 : a < b ? 1 : 0));
+            activityProjectId = String(sorted[0]);
+            console.log('[Tahdiri] Projects/Index scrape — found', idCandidates.size, 'candidates, using latest ProjectId:', activityProjectId);
+          } else {
+            console.warn('[Tahdiri] Projects/Index returned 200 but no ProjectId found. HTML snippet:', html.slice(0, 500));
+          }
+        } else {
+          console.warn('[Tahdiri] Projects/Index fetch failed — status:', projRes.status);
+        }
+      } catch (e) {
+        console.warn('[Tahdiri] Projects/Index scrape failed:', e);
+      }
+
+      // 3c. NOW fetch ManageLecture for the SaveLastLessonPlan CSRF (after Activity is safely created)
       let formHtml = "";
       let finalUrl = scrapeUrl;
       try {
@@ -1405,9 +1626,9 @@
 
       // ── Diagnostic only — do not change behavior ────────────────────
       console.log("[Tahdiri-DIAG] ManageLecture fetch →",
-                  "scrapeUrl:", scrapeUrl,
-                  "| finalUrl:", finalUrl,
-                  "| activityPostedToSchoolId:", realSchoolId);
+        "scrapeUrl:", scrapeUrl,
+        "| finalUrl:", finalUrl,
+        "| activityPostedToSchoolId:", realSchoolId);
       try {
         const finalSchoolMatch = String(finalUrl || "").match(/[?&]SchoolId=([a-f0-9]{32})/i);
         const trueSchoolId = finalSchoolMatch ? finalSchoolMatch[1] : null;
@@ -1441,18 +1662,18 @@
       // Increased buffer to 15000ms to ensure the DB commits the activity before SaveLastLessonPlan runs
       await new Promise(r => setTimeout(r, 15000));
 
-      // 4. Build the SaveLastLessonPlan payload from the scraped hidden inputs
+      // 4. Build the SaveLastLessonPlan payload.
+      // Prefer mlutiFormData (has NUMERIC SchoolId + TimeTableId from server).
+      // Fall back to ManageLecture hidden-input scrape if MlutiLessonPlan failed.
       const finalForm = new FormData();
-
-      // 🔥 SCRAPE ALL HIDDEN INPUTS from every form on the fetched page (not just #CreateResourceForm)
-      const hiddenInputs = doc.querySelectorAll('form input[type="hidden"]');
-      let foundHidden = false;
-      hiddenInputs.forEach(input => {
-        if (input.name) {
-          finalForm.set(input.name, input.value);
-          foundHidden = true;
-        }
-      });
+      if (mlutiFormData) {
+        for (const [k, v] of mlutiFormData.entries()) { finalForm.set(k, v); }
+        console.log('[Tahdiri] Base FormData from MlutiLessonPlan. SchoolId:', finalForm.get('SchoolId'), 'TimeTableId:', finalForm.get('TimeTableId'));
+      } else {
+        console.warn('[Tahdiri] mlutiFormData null — falling back to ManageLecture scrape.');
+        const hiddenInputs = doc.querySelectorAll('form input[type="hidden"]');
+        hiddenInputs.forEach(input => { if (input.name) finalForm.set(input.name, input.value); });
+      }
 
       // The ManageLecture page ALREADY rendered the correct, encrypted TimeTableId
       // as a hidden input (scraped above into finalForm at lines ~1428-1432).
@@ -1474,7 +1695,13 @@
       const classroomId = classroomIdMatch ? classroomIdMatch[1] : "";
 
       let finalTimeTableId = "";
-      if (looksLikeRealToken(scrapedTimeTableId)) {
+      if (mlutiFormData && mlutiFormData.get('TimeTableId')) {
+        // MlutiLessonPlan returned a numeric TimeTableId (e.g. "17886178").
+        // Do NOT run it through looksLikeRealToken — numeric IDs are short (≈8 digits)
+        // and would fail the length >= 16 check.
+        finalTimeTableId = String(mlutiFormData.get('TimeTableId')).trim();
+        console.log('[Tahdiri] Using TimeTableId from MlutiLessonPlan:', finalTimeTableId);
+      } else if (looksLikeRealToken(scrapedTimeTableId)) {
         finalTimeTableId = scrapedTimeTableId;
         console.log("[Tahdiri] Using TimeTableId from ManageLecture hidden input:", finalTimeTableId.slice(0, 16) + "...");
       } else if (looksLikeRealToken(token)) {
@@ -1483,25 +1710,43 @@
         console.log("[Tahdiri] Using TimeTableId from card data-data attr:", finalTimeTableId.slice(0, 16) + "...");
       } else {
         console.error(
-          "[Tahdiri] Could NOT obtain a valid encrypted TimeTableId.\n" +
-          "  scraped from ManageLecture hidden input:", scrapedTimeTableId, "\n" +
-          "  token (data-data) passed in:", token, "\n" +
-          "  scrapeUrl:", scrapeUrl, "\n" +
-          "This is a Blue card whose ManageLecture page redirected (probably wrong SchoolId or wrong subjectId in the constructed URL). Aborting save to avoid /Errors/NotPermitted.",
+          "[Tahdiri] Could NOT obtain a valid TimeTableId.\n" +
+          "  mlutiFormData TimeTableId:", mlutiFormData && mlutiFormData.get('TimeTableId'), "\n" +
+        "  scraped from ManageLecture hidden input:", scrapedTimeTableId, "\n" +
+        "  token (data-data) passed in:", token, "\n" +
+        "  scrapeUrl:", scrapeUrl, "\n" +
+        "This is a Blue card whose ManageLecture page redirected. Aborting.",
           lessonCardDiv
         );
         return false;
       }
 
-      // Force TimeTableId, SchoolId, classroomId — but TimeTableId now uses the validated value.
+      // Force TimeTableId, classroomId — but TimeTableId now uses the validated value.
       finalForm.set('TimeTableId', finalTimeTableId);
-      finalForm.set('SchoolId', realSchoolId);
       if (classroomId) finalForm.set('classroomId', classroomId);
+
+      // ── DO NOT OVERWRITE SchoolId UNCONDITIONALLY ────────────────────
+      // The ManageLecture form's hidden <input name="SchoolId"> contains
+      // the NUMERIC internal school id (e.g. "162189") that
+      // /Teacher/Lessons/SaveLastLessonPlan requires. Our `realSchoolId`
+      // is the 32-hex HASH form (e.g. "6E91EFB4...") which the Activity
+      // /Projects/Projects/Create endpoint accepts but SaveLastLessonPlan
+      // rejects (302 → /Errors/NotPermitted).
+      // The hidden-inputs scrape at line 1457 already put the numeric
+      // value into finalForm. We only fall back to realSchoolId if the
+      // scrape produced nothing (defensive).
+      const scrapedSchoolId = finalForm.get('SchoolId');
+      if (!scrapedSchoolId || String(scrapedSchoolId).trim() === '') {
+        console.warn("[Tahdiri] No SchoolId in scraped ManageLecture form — falling back to realSchoolId (hash). SaveLastLessonPlan may reject this.");
+        finalForm.set('SchoolId', realSchoolId);
+      } else {
+        console.log("[Tahdiri] Using NUMERIC SchoolId from ManageLecture form:", scrapedSchoolId, "(NOT overwriting with hash:", realSchoolId + ")");
+      }
 
       // Pin the CSRF to the one we scraped from the ManageLecture page
       finalForm.set('__RequestVerificationToken', freshCsrf);
 
-      console.log("[Tahdiri] SaveLastLessonPlan — TimeTableId:", finalTimeTableId, "classroomId:", classroomId, "SchoolId:", realSchoolId);
+      console.log("[Tahdiri] SaveLastLessonPlan — TimeTableId:", finalTimeTableId, "classroomId:", classroomId, "SchoolId(form):", finalForm.get('SchoolId'), "realSchoolId(hash):", realSchoolId);
 
       // 3. Inject our lesson selections
       finalForm.append('SubjectId', String(finalSubjectId).trim());
@@ -1517,6 +1762,23 @@
       finalForm.append('LectureClassCloseText', "ملخص شامل لأهم نقاط الدرس.");
       finalForm.append('LessonVocabulary', "المصطلحات والمفاهيم الأساسية الواردة.");
       finalForm.append('TeacherNote', "متابعة أداء الطلاب وتقديم التغذية الراجعة.");
+
+      // Include the Activity so the server validation passes (requires at least one نشاط/واجب/إثراء).
+      if (activityProjectId) {
+        const now = new Date();
+        const pad = (n) => String(n).padStart(2, '0');
+        const fmt = (d) => `${d.getMonth() + 1}/${d.getDate()}/${d.getFullYear()} ${d.getHours()}:${pad(d.getMinutes())}:00 ${d.getHours() >= 12 ? 'PM' : 'AM'}`;
+        const endDate = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000);
+        finalForm.append('LectureProjectsList[0].ProjectId', activityProjectId);
+        finalForm.append('LectureProjectsList[0].Grade', '1');
+        finalForm.append('LectureProjectsList[0].StartTime', fmt(now));
+        finalForm.append('LectureProjectsList[0].EndTime', fmt(endDate));
+        finalForm.append('LectureProjectsList[0].Name', 'واجب');
+        finalForm.append('LectureProjectsList[0].DayCount', '3');
+        console.log('[Tahdiri] Added LectureProjectsList[0].ProjectId:', activityProjectId);
+      } else {
+        console.warn('[Tahdiri] No projectId — SaveLastLessonPlan may fail validation.');
+      }
 
       try {
         const saveRes = await fetch("https://schools.madrasati.sa/Teacher/Lessons/SaveLastLessonPlan", {
@@ -1619,10 +1881,10 @@
           schoolIdSource = "url-bar-fallback";
         }
         console.log("[Tahdiri-DIAG] handleDashboardSave card →",
-                    "subjectId:", subjectId,
-                    "| realSchoolId:", realSchoolId,
-                    "| source:", schoolIdSource,
-                    "| cardDiv:", div);
+          "subjectId:", subjectId,
+          "| realSchoolId:", realSchoolId,
+          "| source:", schoolIdSource,
+          "| cardDiv:", div);
 
         var selection = { treeValue: select.value, treeText: select.options[select.selectedIndex].text };
         tokensToPrepare.push({ select, div: div, token: lessonToken, selection, subjectId, realSchoolId });

@@ -741,3 +741,54 @@ mechanism. Always GET the Create page first, scrape, then POST.
 - All fields verified correct: HashKey, CSRF, SelectedUnitId, SelectedTrees_2, SelectedTrees_3, hfLevelsCount=3
 - `SaveLastLessonPlan` never executes because `activityCreated` returns false
 - Root cause unknown: server silently rejects the Activity POST
+
+## §11. Session Findings — May 2026
+
+### Activity POST — CORRECTED payload (verified from competitor trace)
+- `Id` must be EMPTY STRING `""` — NOT `"0"`
+- `ProjectType` sent TWICE: `"2"` then `""`
+- `AccessType` = `"True"`, `hfLevelsCount` = `"3"`, `TotalGrade` = `"1"`
+- `schoolId` = 32-hex hash (NOT numeric)
+
+### SchoolId — TWO FORMATS
+| Endpoint | Format |
+|----------|--------|
+| `/Projects/Projects/Create` | 32-hex hash |
+| `/Teacher/Lessons/SaveLastLessonPlan` | NUMERIC (e.g. `162189`) |
+
+Numeric SchoolId comes ONLY from MlutiLessonPlan response hidden inputs.
+
+### Correct SaveLastLessonPlan flow
+1. POST `/Teacher/Lessons/MlutiLessonPlan` with `Data=<card data-data blob>`
+   → returns HTML form with NUMERIC SchoolId, TimeTableId, ClassroomId
+   → if empty/too few inputs → abort (token invalid)
+2. POST `/Projects/Projects/Create` → Activity creation
+3. POST `/Teacher/Lessons/SaveLastLessonPlan` using NUMERIC values from step 1
+
+### ACTIVE BLOCKER
+`LectureProjectsList[0].ProjectId` — cannot get valid ProjectId:
+- `/Teacher/LectureTools/GetProjectsList` → 500
+- `/Teacher/Lessons/GetActivitiesList` → 404
+- Root cause: both designed for LearningResources flow, not Projects flow
+
+### PROPOSED FIX (next session)
+Replace `/Projects/Projects/Create` with `/LearningResources/MangeResources/Create`:
+POST /LearningResources/MangeResources/Create
+__RequestVerificationToken=<csrf>
+Id=0
+IsEduResource=true
+SelectedUnitId=<SubjectId from MlutiLessonPlan>
+SelectedGoles=<Base64(JSON.stringify([]))>
+ActivityType=1
+Name=شرح الدرس (<lessonName>)
+Description=
+FileType=
+Link=
+hfLevelsCount=hfLevelsCount
+hfDrawTree=/MangeResources/DrawTreeToClassLesson
+SchoolId=<NUMERIC SchoolId from MlutiLessonPlan>
+This returns ProjectId directly → feeds LectureProjectsList → SaveLastLessonPlan succeeds.
+
+### classroomId=0 issue
+When MlutiLessonPlan returns empty form → classroomId=0 → Save rejected.
+Fix: abort silentPrepareLesson if MlutiLessonPlan fields < 10.

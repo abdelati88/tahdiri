@@ -54,11 +54,9 @@
  * @returns {string}
  */
 function chunkReverse(str, chunkSize) {
-  let result = '';
-  for (let i = 0; i < str.length; i += chunkSize) {
-    result += str.slice(i, i + chunkSize).split('').reverse().join('');
-  }
-  return result;
+  if (!str) return '';
+  const chunks = str.match(new RegExp('.{1,' + chunkSize + '}', 'g')) || [];
+  return chunks.map(c => c.split('').reverse().join('')).join('');
 }
 
 // ── public API ─────────────────────────────────────────────────────────────
@@ -83,10 +81,10 @@ function decryptCompetitorPayload(encryptedString) {
   try {
     let s = encryptedString.trim();
 
-    //  10-step unscrambling pipeline (window['decodeResponse'] in competitor.js)
-    s = chunkReverse(s, 7);                     // step 1
+    //  10-step unscrambling pipeline
+    s = chunkReverse(s, 11);                     // step 1
     s = chunkReverse(s, 2);                     // step 2
-    s = chunkReverse(s, 5);                     // step 3
+    s = chunkReverse(s, 3);                     // step 3
     s = chunkReverse(s, 4);                     // step 4
     s = s.split('').reverse().join('');          // step 5 — full-string reverse
     s = chunkReverse(s, 9);                     // step 6
@@ -106,17 +104,68 @@ function decryptCompetitorPayload(encryptedString) {
     const jsonStr = decodeURIComponent(uriEncoded);
 
     // Step 13: JSON.parse
-    return JSON.parse(jsonStr);
+    // Strip BOM or weird hidden characters before parsing
+    const cleanJsonStr = jsonStr.replace(/^\uFEFF/, '').trim();
+    try {
+        return JSON.parse(cleanJsonStr);
+    } catch (parseErr) {
+        throw new Error("JSON Parse failed on: " + cleanJsonStr.substring(0, 100));
+    }
 
   } catch (err) {
     throw new Error('decryptCompetitorPayload: ' + err.message);
   }
 }
 
+/**
+ * Decrypt the obfuscated payload returned by the competitor's
+ * `getlessonq.php?p_subj=<id>` endpoint (Content).
+ * Uses the original 7, 2, 5, 4 sequence.
+ */
+function decryptContentPayload(encryptedString) {
+  if (typeof encryptedString !== 'string' || !encryptedString.trim()) {
+    throw new Error('decryptContentPayload: input must be a non-empty string');
+  }
+
+  try {
+    let s = encryptedString.trim();
+
+    //  10-step unscrambling pipeline
+    s = chunkReverse(s, 7);                     // step 1
+    s = chunkReverse(s, 2);                     // step 2
+    s = chunkReverse(s, 5);                     // step 3
+    s = chunkReverse(s, 4);                     // step 4
+    s = s.split('').reverse().join('');          // step 5 — full-string reverse
+    s = chunkReverse(s, 9);                     // step 6
+    s = chunkReverse(s, 8);                     // step 7
+    s = chunkReverse(s, 7);                     // step 8
+    s = chunkReverse(s, 6);                     // step 9
+    s = chunkReverse(s, 5);                     // step 10
+
+    const binary     = Buffer.from(s, 'base64').toString('binary');
+    const uriEncoded = binary
+      .split('')
+      .map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2))
+      .join('');
+    const jsonStr = decodeURIComponent(uriEncoded);
+
+    // Strip BOM or weird hidden characters before parsing
+    const cleanJsonStr = jsonStr.replace(/^\uFEFF/, '').trim();
+    try {
+        return JSON.parse(cleanJsonStr);
+    } catch (parseErr) {
+        throw new Error("JSON Parse failed on: " + cleanJsonStr.substring(0, 100));
+    }
+
+  } catch (err) {
+    throw new Error('decryptContentPayload: ' + err.message);
+  }
+}
+
 // ── module export + CLI entry-point ────────────────────────────────────────
 
 if (typeof module !== 'undefined') {
-  module.exports = { decryptCompetitorPayload, chunkReverse };
+  module.exports = { decryptCompetitorPayload, decryptContentPayload, chunkReverse };
 }
 
 if (typeof require !== 'undefined' && require.main === module) {
