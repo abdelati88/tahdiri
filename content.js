@@ -6,6 +6,17 @@
       return; // not our subframe — get out
     }
   }
+
+
+
+
+
+  function getSubjectIdFromUrl() {
+    const urlParams = new URLSearchParams(window.location.search);
+    if (urlParams.has('courseId')) return urlParams.get('courseId');
+    if (urlParams.has('CourseId')) return urlParams.get('CourseId');
+    return null;
+  }
   // --------------------------------------------------------
   const COMPETITOR_PREP_TEXTS = [
     "تحليل المعلومات المقدمة واستنتاج الافكار الرئيسية.",
@@ -177,6 +188,56 @@
           (response) => { resolve(response && response.ok ? response.data : null); }
         );
       });
+    }
+
+    // ── Live fallback: fetch lessons directly from Madrasati's GetGoalLessonSubject endpoint
+    // when the local JSON cache has no entry for this subjectId (e.g., Quran subjects).
+    // Endpoint confirmed via network capture (POST, x-www-form-urlencoded, single field subjectId).
+    // Returns an array shaped like local data items: [{ id, info: { compositeId, chapterId, name } }, ...]
+    // or null on failure.
+    async function fetchGoalLessonSubjectLive(subjectId) {
+      if (!subjectId) return null;
+      try {
+        const url = window.location.origin + '/LearningResources/MangeResources/GetGoalLessonSubject';
+        const body = 'subjectId=' + encodeURIComponent(String(subjectId));
+        const res = await fetch(url, {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            'Accept': 'application/json, text/javascript, */*; q=0.01',
+            'X-Requested-With': 'XMLHttpRequest'
+          },
+          body: body
+        });
+        if (!res.ok) {
+          console.warn('[TAHDIRI LIVE] GetGoalLessonSubject HTTP', res.status, 'for subjectId=', subjectId);
+          return null;
+        }
+        const data = await res.json();
+        if (!Array.isArray(data) || data.length === 0) {
+          console.warn('[TAHDIRI LIVE] GetGoalLessonSubject returned empty/non-array for subjectId=', subjectId);
+          return null;
+        }
+        const lessons = [];
+        for (const row of data) {
+          if (!row || row.LessonId == null || !row.LessonTitle) continue;
+          const treeId = (row.TreeId != null ? row.TreeId : '');
+          lessons.push({
+            id: row.LessonId,
+            info: {
+              compositeId: String(subjectId) + ',' + String(treeId) + ',' + String(row.LessonId),
+              chapterId: treeId,
+              name: row.LessonTitle
+            }
+          });
+        }
+        console.log('[TAHDIRI LIVE] GetGoalLessonSubject OK for subjectId=', subjectId, 'lessons=', lessons.length);
+        return lessons;
+      } catch (e) {
+        console.warn('[TAHDIRI LIVE] GetGoalLessonSubject fetch error for subjectId=', subjectId, e);
+        return null;
+      }
     }
     async function getLocalTemplates() {
       return new Promise((resolve) => {
@@ -880,6 +941,34 @@
           });
         }
       }
+      // [TAHDIRI HYBRID] Live fallback: when local JSON yielded no real lessons (only AI_AUTO),
+      // call the Madrasati GetGoalLessonSubject endpoint directly. Confirmed via network capture.
+      if (optionsArray.length <= 1 && subjectId) {
+        console.log('[TAHDIRI HYBRID] Local cache miss for subjectId=', subjectId, '→ trying live GetGoalLessonSubject');
+        const liveLessons = await fetchGoalLessonSubjectLive(subjectId);
+        if (Array.isArray(liveLessons) && liveLessons.length > 0) {
+          for (const lesson of liveLessons) {
+            if (lesson && lesson.info && lesson.info.compositeId && lesson.info.name) {
+              optionsArray.push({
+                value: lesson.info.compositeId,
+                text: lesson.info.name,
+                level: '1'
+              });
+            }
+          }
+        }
+      }
+      // Diagnostic log: if STILL no real lessons after both local + live attempts,
+      // print the offending subjectId + subjectName for further investigation.
+      if (optionsArray.length <= 1) {
+        console.warn('[Tahdiri] EMPTY LESSON LIST for card (after local + live) →', {
+          subjectId: subjectId,
+          subjectName: subjectName,
+          subjectDataFound: !!subjectData,
+          subjectDataHasGroups: !!(subjectData && subjectData.groups && subjectData.groups.length),
+          subjectDataHasRaw: !!(subjectData && subjectData.rawLessonsList && subjectData.rawLessonsList.length)
+        });
+      }
       return optionsArray;
     }
 
@@ -1284,11 +1373,41 @@
         const html = await getRes.text();
         const parser = new DOMParser();
         doc = parser.parseFromString(html, "text/html");
-        // CRITICAL: Both token and hashKey MUST come from the same page render.
-        // The passed-in csrfToken (dashboard fallback) must NOT be used here —
-        // mismatched token/hashKey pairs cause the POST to 302 silently.
-        token = doc.querySelector('[name="__RequestVerificationToken"]')?.value || "";
+        // CRITICAL: Madrasati's Create page contains MULTIPLE forms, each with its own
+        // __RequestVerificationToken (logout form, header search, Create form, etc.).
+        // querySelector('[name="__RequestVerificationToken"]') returns the FIRST one,
+        // which is typically empty (belongs to a layout form), causing token="" and
+        // the "Could not scrape CSRF token" error.
+        //
+        // Strategy: HashKey is UNIQUE to the Create form. Find it first, walk up to
+        // its enclosing <form>, and extract the token from THAT form.
         hashKey = doc.querySelector('[name="HashKey"]')?.value || "";
+
+        const hashKeyEl = doc.querySelector('[name="HashKey"]');
+        const createForm = hashKeyEl?.closest('form');
+        if (createForm) {
+          token = createForm.querySelector('[name="__RequestVerificationToken"]')?.value || "";
+        }
+
+        // Fallback: if scoping failed, scan ALL __RequestVerificationToken inputs and
+        // pick the first NON-EMPTY one (usually the Create form's token).
+        if (!token) {
+          const allTokens = doc.querySelectorAll('[name="__RequestVerificationToken"]');
+          for (const el of allTokens) {
+            if (el.value && el.value.length > 20) {
+              token = el.value;
+              console.log('[Tahdiri] CSRF token resolved via fallback scan (token #' +
+                Array.from(allTokens).indexOf(el) + ' of ' + allTokens.length + ')');
+              break;
+            }
+          }
+        }
+
+        console.log('[Tahdiri] Create page scrape →',
+          'tokens found:', doc.querySelectorAll('[name="__RequestVerificationToken"]').length,
+          '| token resolved:', token ? token.slice(0, 30) + '...' : 'EMPTY',
+          '| hashKey:', hashKey ? hashKey.slice(0, 30) + '...' : 'EMPTY',
+          '| createForm found:', !!createForm);
       } catch (e) {
         console.error("[Tahdiri] Failed to fetch Create page for tokens", e);
         return false;
@@ -1335,16 +1454,24 @@
 
       console.log("[Tahdiri] Activity POST full payload:", payload.toString());
       try {
+        // Use redirect:'manual' so we can read the Location header.
+        // The server typically 302-redirects to /Projects/Projects/Edit/{newId} or similar.
         const saveRes = await fetch("/Projects/Projects/Create", {
           method: "POST",
           credentials: "same-origin",
+          redirect: "manual",
           headers: {
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
             "requestverificationtoken": token
           },
           body: payload.toString()
         });
-        console.log("[Tahdiri] Activity POST response — status:", saveRes.status, "url:", saveRes.url);
+        console.log("[Tahdiri] Activity POST response — status:", saveRes.status, "type:", saveRes.type, "url:", saveRes.url);
+        // Status 0 + type 'opaqueredirect' means the redirect happened — treat as success.
+        if (saveRes.type === 'opaqueredirect' || saveRes.status === 0) {
+          console.log("[Tahdiri] Activity POST → opaque redirect (treated as success)");
+          return true;
+        }
         if (!saveRes.ok) return false;
         return true;
       } catch (e) {
@@ -1364,124 +1491,67 @@
 
     async function bulkDownloadAllLecturePDFs(opts) {
       opts = opts || {};
-      const delayMs = typeof opts.delayMs === "number" ? opts.delayMs : 1200;
-      const onlyPrepared = opts.onlyPrepared !== false; // default true
+      const delayMs = opts.delayMs || 2500;
 
-      const cards = Array.from(document.querySelectorAll("div.cs-lesson-card"));
+      // 1. نجيب كل الكروت الخضراء
+      const cards = Array.from(document.querySelectorAll("div.cs-lesson-card"))
+        .filter(c => c.querySelector(".schedule-card.done") || c.classList.contains("tahdiri-processed"));
+
       if (!cards.length) {
-        console.warn("[Tahdiri-Bulk] No .cs-lesson-card elements found on the page.");
-        return { ok: false, reason: "no_cards" };
+        console.warn("[Tahdiri-Bulk] مفيش دروس محضرّة (خضراء) في الصفحة دي.");
+        return;
       }
 
-      const csrf = (typeof getCsrfToken === "function") ? getCsrfToken() : "";
-      console.log("[Tahdiri-Bulk] Found " + cards.length + " cards. CSRF len=" + (csrf || "").length);
+      console.log(`[Tahdiri-Bulk] جاري العمل على ${cards.length} درس...`);
 
-      const results = [];
-      let idx = 0;
-
-      for (const card of cards) {
-        idx++;
-        let token = card.getAttribute("data-data");
-        if (!token) {
-          const elWithToken = card.querySelector("[data-data]");
-          if (elWithToken) {
-            token = elWithToken.getAttribute("data-data");
-          }
-        }
-        const isPrepared = card.querySelector(".schedule-card.done") || card.classList.contains("tahdiri-processed");
-
-        if (onlyPrepared && !isPrepared) {
-          console.log("[Tahdiri-Bulk] [" + idx + "/" + cards.length + "] SKIP (not prepared / blue card)");
-          results.push({ idx: idx, status: "skipped_blue" });
-          continue;
-        }
-        if (!token || token.length < 16) {
-          console.log("[Tahdiri-Bulk] [" + idx + "/" + cards.length + "] SKIP (no data-data token)");
-          results.push({ idx: idx, status: "skipped_no_token" });
-          continue;
-        }
-
-        // Try to build a meaningful filename from DOM
-        const subjectEl = card.querySelector("h2, .title h2, .title");
-        const gradeEl = card.querySelector("small");
-        const cell = card.closest("td");
-        const rowTh = cell ? (cell.parentElement && cell.parentElement.querySelector("th")) : null;
-        const dayLabel = rowTh ? rowTh.textContent.trim() : "";
-        const headerCells = cell && cell.parentElement && cell.parentElement.parentElement
-          ? cell.parentElement.parentElement.querySelector("tr")
-          : null;
-        let slotLabel = "";
-        if (cell && headerCells) {
-          const tds = Array.from(cell.parentElement.children);
-          const colIdx = tds.indexOf(cell);
-          const ths = headerCells.querySelectorAll("th");
-          if (colIdx >= 0 && ths[colIdx]) slotLabel = ths[colIdx].textContent.trim();
-        }
-
-        const subject = subjectEl ? subjectEl.textContent.trim() : "subject";
-        const grade = gradeEl ? gradeEl.textContent.trim() : "";
-        const fnameRaw = [dayLabel, slotLabel, subject, grade].filter(Boolean).join("_");
-        const fname = _sanitizeFilename(fnameRaw) + "__" + idx + ".pdf";
+      for (let i = 0; i < cards.length; i++) {
+        const card = cards[i];
+        const lessonTitle = card.querySelector("h2")?.textContent.trim() || "lesson";
+        console.log(`[${i + 1}/${cards.length}] جاري معالجة: ${lessonTitle}`);
 
         try {
-          console.log("[Tahdiri-Bulk] [" + idx + "/" + cards.length + "] POST PrintLecture — " + fname);
-          const body = new URLSearchParams();
-          body.append("Data", token);
+          // 2. ندور على رابط صفحة التفاصيل (الرابط اللي بيوديك لصفحة الدرس)
+          const detailsLink = card.querySelector("a")?.href;
+          if (!detailsLink) continue;
 
-          const headers = {
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "X-Requested-With": "XMLHttpRequest"
-          };
-          if (csrf) headers["requestverificationtoken"] = csrf;
+          // 3. نفتح صفحة التفاصيل في الخلفية
+          const response = await fetch(detailsLink);
+          const html = await response.text();
 
-          const res = await fetch("/Teacher/Lessons/PrintLecture", {
-            method: "POST",
-            credentials: "same-origin",
-            headers: headers,
-            body: body.toString()
-          });
+          // 4. ندور جوه صفحة التفاصيل على زرار الطباعة الأصلي
+          const parser = new DOMParser();
+          const doc = parser.parseFromString(html, "text/html");
+          const printBtn = doc.querySelector("a[href*='PrintLecture']");
 
-          if (!res.ok) {
-            console.warn("[Tahdiri-Bulk] [" + idx + "] HTTP " + res.status + " — " + res.url);
-            results.push({ idx: idx, status: "http_error", code: res.status, fname: fname });
-            await new Promise(r => setTimeout(r, delayMs));
-            continue;
+          if (printBtn) {
+            const printUrl = new URL(printBtn.href, window.location.origin).href;
+
+            // 5. نحمل صفحة الطباعة
+            const printRes = await fetch(printUrl);
+            const printHtml = await printRes.text();
+
+            // 6. حفظ الملف
+            const blob = new Blob([printHtml], { type: "text/html" });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = `${_sanitizeFilename(lessonTitle)}__${i + 1}.html`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            console.log(`%c [✓] تم حفظ: ${lessonTitle}`, "color: green");
+          } else {
+            console.warn(`[!] ملقيتش زرار طباعة جوه درس: ${lessonTitle}`);
           }
 
-          const ctype = res.headers.get("content-type") || "";
-          const blob = await res.blob();
-
-          if (!/pdf/i.test(ctype) && blob.size < 2000) {
-            const text = await blob.text();
-            console.warn("[Tahdiri-Bulk] [" + idx + "] non-PDF response (ctype=" + ctype + ", size=" + blob.size + "). Snippet:", text.slice(0, 200));
-            results.push({ idx: idx, status: "not_pdf", ctype: ctype, size: blob.size, fname: fname });
-            await new Promise(r => setTimeout(r, delayMs));
-            continue;
-          }
-
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement("a");
-          a.href = url;
-          a.download = fname;
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
-          setTimeout(() => URL.revokeObjectURL(url), 5000);
-
-          console.log("[Tahdiri-Bulk] [" + idx + "] ✓ saved " + fname + " (" + blob.size + " bytes)");
-          results.push({ idx: idx, status: "ok", size: blob.size, fname: fname });
-        } catch (e) {
-          console.error("[Tahdiri-Bulk] [" + idx + "] EXCEPTION", e);
-          results.push({ idx: idx, status: "exception", error: String(e) });
+        } catch (err) {
+          console.error(`[X] فشل في معالجة ${lessonTitle}:`, err);
         }
 
+        // تأخير عشان السيرفر ميزعلش
         await new Promise(r => setTimeout(r, delayMs));
       }
-
-      console.table(results);
-      const okCount = results.filter(r => r.status === "ok").length;
-      console.log("[Tahdiri-Bulk] DONE — " + okCount + "/" + cards.length + " PDFs downloaded.");
-      return { ok: true, total: cards.length, downloaded: okCount, results: results };
+      console.log("[Tahdiri-Bulk] مبروك يا هندسة.. الداتا بقت عندك!");
     }
 
     // Expose for manual invocation from DevTools console
@@ -1523,7 +1593,12 @@
         return false;
       }
 
-      // 2. Create the Activity FIRST — before any ManageLecture fetch that could invalidate the HashKey
+      // ─── Step 1 of DIFF strategy: capture BEFORE snapshot of existing Projects for this scope.
+      //     We capture it BEFORE Activity Create so we can detect the new ID afterwards.
+      const beforeSnapshot = await fetchProjectsListSnapshot('before-create');
+      console.log('[Tahdiri] DIFF baseline captured:', beforeSnapshot.size, 'existing project IDs');
+
+      // Create the Activity FIRST — before any ManageLecture fetch that could invalidate the HashKey
       const activityCreated = await silentCreateActivityResource(treeSubjectId, chapterId, lessonId, lessonName, realSchoolId, null);
       console.log('[Tahdiri] Activity created:', activityCreated);
 
@@ -1531,6 +1606,9 @@
         console.error("[Tahdiri] Activity creation failed - aborting lesson save.");
         return false;
       }
+
+      // CRITICAL DB sync — the new row needs time to commit before GetProjectsList sees it.
+      await new Promise(r => setTimeout(r, 2000));
 
       // 3a. Call MlutiLessonPlan to get NUMERIC SchoolId + TimeTableId for SaveLastLessonPlan.
       // The `token` is the card's `data-data` encrypted blob. Posting it to MlutiLessonPlan
@@ -1574,42 +1652,170 @@
         console.warn('[Tahdiri] token is not a blob — skipping MlutiLessonPlan. token:', String(token || '').slice(0, 20));
       }
 
-      // 3b. Fetch the Activity's ProjectId by scraping /Projects/Projects/Index/{schoolId}
-      // The JSON endpoint /Teacher/LectureTools/GetProjectsList returns 500 (broken).
-      // The HTML page /Projects/Projects/Index/{schoolId} lists all projects for the school;
-      // we parse the latest ProjectId from data-id attributes or /Edit/{id} URLs.
+      // 3b. Resolve the just-created Activity's ProjectId via a layered probe.
+      // Confirmed via prior diagnostics:
+      //   - /Projects/Projects/Index/{schoolId} returns only the navbar/page shell (no project IDs in HTML).
+      //   - /Teacher/LectureTools/GetActivitiesList → 302 to NotPermitted (forbidden for this role).
+      //   - Activity POST returns success but does not echo back the new ProjectId.
+      // Strategy: try three sources in order; first numeric ID wins.
       let activityProjectId = '';
-      try {
-        const indexUrl = `/Projects/Projects/Index/${encodeURIComponent(realSchoolId)}?hfLevelsCount=3`;
-        const projRes = await fetch(indexUrl, { credentials: 'same-origin' });
-        if (projRes.ok) {
-          const html = await projRes.text();
-          // Match patterns the Madrasati Projects/Index page uses to render each row.
-          // Capture ALL ids on the page and take the largest (most recently created).
-          const idCandidates = new Set();
-          const patterns = [
-            /data-id=["'](\d{5,12})["']/g,
-            /\/Projects\/Projects\/Edit\/(\d{5,12})/g,
-            /\/Projects\/Projects\/Delete\/(\d{5,12})/g,
-            /ProjectId["']?\s*[:=]\s*["']?(\d{5,12})/g
-          ];
-          for (const re of patterns) {
-            let m;
-            while ((m = re.exec(html)) !== null) idCandidates.add(m[1]);
-          }
-          if (idCandidates.size > 0) {
-            // Most recently created project has the highest numeric ID (auto-increment PK).
-            const sorted = [...idCandidates].map(s => BigInt(s)).sort((a, b) => (a > b ? -1 : a < b ? 1 : 0));
-            activityProjectId = String(sorted[0]);
-            console.log('[Tahdiri] Projects/Index scrape — found', idCandidates.size, 'candidates, using latest ProjectId:', activityProjectId);
+
+      // ─── Helper: call GetProjectsList and return Set of all numeric Project IDs in the response.
+      //    Used twice (before + after Activity Create) to compute the diff.
+      async function fetchProjectsListSnapshot(label) {
+        const body = new URLSearchParams();
+        body.append('title', '');
+        body.append('lectureProjectsList', '');
+        body.append('sumLectureProjectsGradeBook', '0');
+        body.append('selectedUnitId', String(finalSubjectId).trim());
+        body.append('treeId', String(lessonId).trim());
+        body.append('lessonsId[]', String(lessonId).trim());
+        body.append('childOfSubject', String(chapterId).trim());
+        body.append('accessType', '');
+        body.append('createdByme', 'false');
+        body.append('schoolId', String(realSchoolId).trim());
+
+        const snapIds = new Set();
+        try {
+          const res = await fetch('/Teacher/LectureTools/GetProjectsList', {
+            method: 'POST',
+            credentials: 'same-origin',
+            redirect: 'follow',
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+              'Accept': '*/*',
+              'X-Requested-With': 'XMLHttpRequest',
+              'Origin': 'https://schools.madrasati.sa',
+              'Referer': location.href
+            },
+            body: body.toString()
+          });
+          if (res.status >= 200 && res.status < 400) {
+            const bodyText = await res.text();
+            let htmlInner = bodyText;
+            try {
+              const j = JSON.parse(bodyText);
+              if (j && typeof j.html === 'string') htmlInner = j.html;
+            } catch (_) {}
+            // The relevant IDs are on the <a class="selectProject" id="<numeric>">
+            // and also in setDefaultDates(<numeric>) onclick handlers.
+            const patterns = [
+              /class=["'][^"']*selectProject[^"']*["'][^>]*id=["'](\d{6,12})["']/gi,
+              /id=["'](\d{6,12})["'][^>]*class=["'][^"']*selectProject/gi,
+              /setDefaultDates\(\s*["']?(\d{6,12})["']?\s*\)/g,
+              /\/Projects\/Projects\/(?:Edit|Delete|Details|Show)\/(\d{6,12})/g,
+              /name=["']LectureProjectsList\[\d+\]\.ProjectId["'][^>]*value=["'](\d{6,12})["']/gi,
+              /value=["'](\d{6,12})["'][^>]*name=["']LectureProjectsList\[\d+\]\.ProjectId["']/gi
+            ];
+            for (const re of patterns) {
+              let m;
+              while ((m = re.exec(htmlInner)) !== null) snapIds.add(m[1]);
+            }
+            console.log('[Tahdiri] GetProjectsList snapshot [' + label + ']: status=' + res.status + ', candidates=' + snapIds.size);
           } else {
-            console.warn('[Tahdiri] Projects/Index returned 200 but no ProjectId found. HTML snippet:', html.slice(0, 500));
+            console.warn('[Tahdiri] GetProjectsList snapshot [' + label + ']: non-2xx status=' + res.status);
           }
+        } catch (e) {
+          console.warn('[Tahdiri] GetProjectsList snapshot [' + label + '] threw:', e && e.message);
+        }
+        return snapIds;
+      }
+
+      // ─── Tier A: DIFF-BASED ProjectId resolution (single-attempt version).
+      //
+      //   We already captured `beforeSnapshot` BEFORE silentCreateActivityResource.
+      //   We waited 2000ms for DB sync. Now we take `afterSnapshot` and diff.
+      //   The new entry IS our newly-created Activity's ProjectId.
+      try {
+        const afterSnapshot = await fetchProjectsListSnapshot('after-create');
+        const newIds = [...afterSnapshot].filter(id => !beforeSnapshot.has(id));
+
+        if (newIds.length === 1) {
+          activityProjectId = newIds[0];
+          console.log('[Tahdiri] ✅ Tier-A DIFF SUCCESS — new ProjectId:', activityProjectId,
+            '(before:', beforeSnapshot.size, 'after:', afterSnapshot.size, ')');
+        } else if (newIds.length > 1) {
+          // Race condition (another teacher created an Activity in the same scope in this exact 2-3s window).
+          // Pick the largest BigInt as a tiebreaker — our Activity is almost certainly the most recent.
+          const sorted = newIds.map(s => BigInt(s)).sort((a, b) => (a > b ? -1 : a < b ? 1 : 0));
+          activityProjectId = String(sorted[0]);
+          console.warn('[Tahdiri] ⚠️ Tier-A DIFF: ' + newIds.length + ' new IDs (race condition?). Picked largest:', activityProjectId, 'all new:', newIds);
+        } else if (afterSnapshot.size === beforeSnapshot.size) {
+          // No new ID — Activity Create may have failed silently.
+          console.error('[Tahdiri] ❌ Tier-A DIFF: no new ID detected (before=' + beforeSnapshot.size + ', after=' + afterSnapshot.size + '). Activity Create likely failed server-side despite returning success.');
         } else {
-          console.warn('[Tahdiri] Projects/Index fetch failed — status:', projRes.status);
+          console.warn('[Tahdiri] ⚠️ Tier-A DIFF: unexpected state. before=' + beforeSnapshot.size + ' after=' + afterSnapshot.size + ' newIds=' + newIds.length);
         }
       } catch (e) {
-        console.warn('[Tahdiri] Projects/Index scrape failed:', e);
+        console.warn('[Tahdiri] Tier-A diff threw:', e && e.message);
+      }
+
+      // ─── Tier B Scrape ManageLecture HTML
+      if (!activityProjectId) {
+        try {
+          let mlHtml = (typeof dashboardManageLectureHtml === 'string' && dashboardManageLectureHtml.length > 0)
+            ? dashboardManageLectureHtml
+            : '';
+          if (!mlHtml) {
+            const mlScrapeUrl = (typeof scrapeUrl === 'string' && scrapeUrl) ? scrapeUrl : '';
+            if (mlScrapeUrl) {
+              const mlRes = await fetch(mlScrapeUrl, { credentials: 'same-origin' });
+              if (mlRes.ok) mlHtml = await mlRes.text();
+            }
+          }
+          if (mlHtml) {
+            const candidates = new Set();
+            const patterns = [
+              /name=["']LectureProjectsList\[\d+\]\.ProjectId["'][^>]*value=["'](\d{5,12})["']/g,
+              /value=["'](\d{5,12})["'][^>]*name=["']LectureProjectsList\[\d+\]\.ProjectId["']/g,
+              /<option[^>]*value=["'](\d{5,12})["'][^>]*selected/g,
+              /data-project-id=["'](\d{5,12})["']/g,
+              /ProjectId["']?\s*:\s*["']?(\d{5,12})/g
+            ];
+            for (const re of patterns) {
+              let m;
+              while ((m = re.exec(mlHtml)) !== null) candidates.add(m[1]);
+            }
+            if (candidates.size > 0) {
+              const sorted = [...candidates].map(s => BigInt(s)).sort((a, b) => (a > b ? -1 : a < b ? 1 : 0));
+              activityProjectId = String(sorted[0]);
+            }
+          }
+        } catch (e) {}
+      }
+
+      // ─── Tier C Scrape Projects/Index
+      if (!activityProjectId) {
+        try {
+          const indexUrl = `/Projects/Projects/Index/${encodeURIComponent(realSchoolId)}?hfLevelsCount=3`;
+          const projRes = await fetch(indexUrl, { credentials: 'same-origin' });
+          if (projRes.ok) {
+            const html = await projRes.text();
+            const idCandidates = new Set();
+            const patterns = [
+              /data-id=["'](\d{5,12})["']/g,
+              /\/Projects\/Projects\/(?:Edit|Delete|Details)\/(\d{5,12})/g,
+              /ProjectId["']?\s*[:=]\s*["']?(\d{5,12})/g,
+              /name=["']ProjectId["'][^>]*value=["'](\d{5,12})["']/g,
+              /value=["'](\d{5,12})["'][^>]*name=["']ProjectId["']/g,
+              /<input[^>]+id=["']ProjectId_(\d{5,12})["']/g
+            ];
+            for (const re of patterns) {
+              let m;
+              while ((m = re.exec(html)) !== null) idCandidates.add(m[1]);
+            }
+            if (idCandidates.size > 0) {
+              const sorted = [...idCandidates].map(s => BigInt(s)).sort((a, b) => (a > b ? -1 : a < b ? 1 : 0));
+              activityProjectId = String(sorted[0]);
+            }
+          }
+        } catch (e) {}
+      }
+
+      if (activityProjectId) {
+        console.log('[Tahdiri] ✅ Final ProjectId for SaveLastLessonPlan:', activityProjectId);
+      } else {
+        console.warn('[Tahdiri] ❌ No ProjectId resolved from any tier — SaveLastLessonPlan will be sent without it.');
       }
 
       // 3c. NOW fetch ManageLecture for the SaveLastLessonPlan CSRF (after Activity is safely created)
@@ -1749,11 +1955,35 @@
       console.log("[Tahdiri] SaveLastLessonPlan — TimeTableId:", finalTimeTableId, "classroomId:", classroomId, "SchoolId(form):", finalForm.get('SchoolId'), "realSchoolId(hash):", realSchoolId);
 
       // 3. Inject our lesson selections
+      // CRITICAL: Madrasati requires BOTH SubjectId AND SelectedUnitId — they map to different
+      // server-side validators. Missing SelectedUnitId returns 400 with the message
+      // "لا يمكن ترك حقل مسار الدرس بدون اختيار".
       finalForm.append('SubjectId', String(finalSubjectId).trim());
+      finalForm.append('SelectedUnitId', String(finalSubjectId).trim());
       finalForm.append('LessonIds[0].Id', String(lessonId).trim());
       finalForm.append('LessonIds[0].Name', lessonName);
       finalForm.append('SelectedTrees_2', String(chapterId).trim());
       finalForm.append('SelectedTrees_3', String(lessonId).trim());
+
+      // CRITICAL: Madrasati requires LessonType and LessonTempleateType — verified from competitor's
+      // successful Save trace. Missing LessonType returns 400 with
+      // "لا يمكن ترك حقل نوع الدرس فارغاً".
+      //   LessonType=2          → "درس جديد" (new lesson, the default)
+      //   LessonTempleateType=1 → standard template ID
+      // Use append() — these are NEW fields, not overwrites of fields scraped from MlutiLessonPlan.
+      // If MlutiLessonPlan already provided them, the duplicate is harmless (server takes the last).
+      if (!finalForm.has('LessonType') || !finalForm.get('LessonType')) {
+        finalForm.append('LessonType', '2');
+      }
+      if (!finalForm.has('LessonTempleateType') || !finalForm.get('LessonTempleateType')) {
+        finalForm.append('LessonTempleateType', '1');
+      }
+
+      console.log('[Tahdiri] Save form critical fields →',
+        'SubjectId:', finalForm.get('SubjectId'),
+        'SelectedUnitId:', finalForm.get('SelectedUnitId'),
+        'LessonType:', finalForm.get('LessonType'),
+        'LessonTempleateType:', finalForm.get('LessonTempleateType'));
 
       // Core content fields
       finalForm.append('strategies', '4');
@@ -1765,17 +1995,70 @@
 
       // Include the Activity so the server validation passes (requires at least one نشاط/واجب/إثراء).
       if (activityProjectId) {
-        const now = new Date();
-        const pad = (n) => String(n).padStart(2, '0');
-        const fmt = (d) => `${d.getMonth() + 1}/${d.getDate()}/${d.getFullYear()} ${d.getHours()}:${pad(d.getMinutes())}:00 ${d.getHours() >= 12 ? 'PM' : 'AM'}`;
-        const endDate = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000);
+        // CRITICAL: LectureProjectsList[0].StartTime MUST equal MultiPrepareLesson[0].StartDate
+        // (the scheduled lecture time, NOT the current time). Otherwise Madrasati rejects the
+        // save with "الرجاء مراجعة بيانات الأنشطة" because the project window doesn't align
+        // with the lecture window.
+        //
+        // Format target (matches competitor's working trace exactly):
+        //   StartTime: "5/17/2026 8:52:00 AM"   (no leading zeros on M/D/H)
+        //   EndTime:   "5/20/2026 8:52:00 AM"   (StartTime + 3 days)
+
+        // 1) Try to read the lecture's actual StartDate from the form (set earlier from MlutiLessonPlan).
+        //    MlutiLessonPlan hidden inputs use the format "MM/DD/YYYY HH:mm:ss" (24h, zero-padded).
+        const rawLectureStart = finalForm.get('MultiPrepareLesson[0].StartDate')
+                              || finalForm.get('StartDate')
+                              || '';
+
+        // Parse "MM/DD/YYYY HH:mm:ss" defensively. Fall back to "now" only if parsing fails.
+        function parseMadrasatiDate(s) {
+          if (!s || typeof s !== 'string') return null;
+          const m = s.trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{1,2}):(\d{1,2})$/);
+          if (!m) return null;
+          const [, mo, da, yr, hh, mm, ss] = m;
+          const d = new Date(Number(yr), Number(mo) - 1, Number(da), Number(hh), Number(mm), Number(ss));
+          return isNaN(d.getTime()) ? null : d;
+        }
+
+        let startDate = parseMadrasatiDate(rawLectureStart);
+        if (!startDate) {
+          console.warn('[Tahdiri] LectureProjectsList: could not parse MultiPrepareLesson[0].StartDate; using now() as fallback. raw=', JSON.stringify(rawLectureStart));
+          startDate = new Date();
+        } else {
+          console.log('[Tahdiri] LectureProjectsList: using lecture StartDate from form:', rawLectureStart, '→ parsed:', startDate.toString());
+        }
+
+        // 2) EndTime = StartTime + 3 days (DayCount=3)
+        const endDate = new Date(startDate.getTime() + 3 * 24 * 60 * 60 * 1000);
+
+        // 3) Format like the competitor: "M/D/YYYY H:MM:SS AM/PM" (12h, no leading zeros except minutes/seconds)
+        function fmtProjectTime(d) {
+          const month = d.getMonth() + 1;             // no pad
+          const day   = d.getDate();                  // no pad
+          const year  = d.getFullYear();
+          let   hour  = d.getHours();
+          const min   = String(d.getMinutes()).padStart(2, '0');
+          const sec   = String(d.getSeconds()).padStart(2, '0');
+          const ampm  = hour >= 12 ? 'PM' : 'AM';
+          hour = hour % 12;
+          if (hour === 0) hour = 12;
+          return `${month}/${day}/${year} ${hour}:${min}:${sec} ${ampm}`;
+        }
+
+        const startTimeStr = fmtProjectTime(startDate);
+        const endTimeStr   = fmtProjectTime(endDate);
+
         finalForm.append('LectureProjectsList[0].ProjectId', activityProjectId);
         finalForm.append('LectureProjectsList[0].Grade', '1');
-        finalForm.append('LectureProjectsList[0].StartTime', fmt(now));
-        finalForm.append('LectureProjectsList[0].EndTime', fmt(endDate));
+        finalForm.append('LectureProjectsList[0].StartTime', startTimeStr);
+        finalForm.append('LectureProjectsList[0].EndTime', endTimeStr);
         finalForm.append('LectureProjectsList[0].Name', 'واجب');
         finalForm.append('LectureProjectsList[0].DayCount', '3');
-        console.log('[Tahdiri] Added LectureProjectsList[0].ProjectId:', activityProjectId);
+
+        console.log('[Tahdiri] LectureProjectsList[0] →',
+          'ProjectId:', activityProjectId,
+          'StartTime:', startTimeStr,
+          'EndTime:', endTimeStr);
       } else {
         console.warn('[Tahdiri] No projectId — SaveLastLessonPlan may fail validation.');
       }

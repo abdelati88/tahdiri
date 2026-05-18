@@ -244,28 +244,28 @@ function handleDataRequest(msg, sendResponse) {
       course = dbCache.courses.find(c => String(c.subjectId) === String(msg.subjectId));
     }
     if (!course && msg.subjectName) {
-       const searchName = normalizeSubjectName(msg.subjectName);
-       course = dbCache.courses.find(c => {
-           let cName = '';
-           // groups is an array-of-arrays: groups[chapter][lesson] = {id, info:{name,...}}.
-           // Walk through to the first lesson that actually has an info.name.
-           if (Array.isArray(c.groups) && c.groups.length > 0) {
-               const firstHead = c.groups[0];
-               let firstLesson = null;
-               if (Array.isArray(firstHead)) {
-                   firstLesson = firstHead.find(l => l && l.info && l.info.name);
-               } else if (firstHead && firstHead.info) {
-                   firstLesson = firstHead;
-               }
-               if (firstLesson && firstLesson.info && firstLesson.info.name) {
-                   cName = normalizeSubjectName(firstLesson.info.name.split('--')[0]);
-               }
-           }
-           if (!cName && c.rawLessonsList && c.rawLessonsList.length > 0 && c.rawLessonsList[0].name) {
-               cName = normalizeSubjectName(c.rawLessonsList[0].name.split('--')[0]);
-           }
-           return cName && (cName.includes(searchName) || searchName.includes(cName));
-       });
+      const searchName = normalizeSubjectName(msg.subjectName);
+      course = dbCache.courses.find(c => {
+        let cName = '';
+        // groups is an array-of-arrays: groups[chapter][lesson] = {id, info:{name,...}}.
+        // Walk through to the first lesson that actually has an info.name.
+        if (Array.isArray(c.groups) && c.groups.length > 0) {
+          const firstHead = c.groups[0];
+          let firstLesson = null;
+          if (Array.isArray(firstHead)) {
+            firstLesson = firstHead.find(l => l && l.info && l.info.name);
+          } else if (firstHead && firstHead.info) {
+            firstLesson = firstHead;
+          }
+          if (firstLesson && firstLesson.info && firstLesson.info.name) {
+            cName = normalizeSubjectName(firstLesson.info.name.split('--')[0]);
+          }
+        }
+        if (!cName && c.rawLessonsList && c.rawLessonsList.length > 0 && c.rawLessonsList[0].name) {
+          cName = normalizeSubjectName(c.rawLessonsList[0].name.split('--')[0]);
+        }
+        return cName && (cName.includes(searchName) || searchName.includes(cName));
+      });
     }
     sendResponse({ ok: true, data: course || null });
   }

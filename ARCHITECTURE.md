@@ -765,30 +765,96 @@ Numeric SchoolId comes ONLY from MlutiLessonPlan response hidden inputs.
 2. POST `/Projects/Projects/Create` → Activity creation
 3. POST `/Teacher/Lessons/SaveLastLessonPlan` using NUMERIC values from step 1
 
-### ACTIVE BLOCKER
-`LectureProjectsList[0].ProjectId` — cannot get valid ProjectId:
-- `/Teacher/LectureTools/GetProjectsList` → 500
-- `/Teacher/Lessons/GetActivitiesList` → 404
-- Root cause: both designed for LearningResources flow, not Projects flow
+### ACTIVE BLOCKER (UPDATED — May 14)
+`LectureProjectsList[0].ProjectId` — still cannot get valid ProjectId. All known sources have been probed and failed:
 
-### PROPOSED FIX (next session)
-Replace `/Projects/Projects/Create` with `/LearningResources/MangeResources/Create`:
-POST /LearningResources/MangeResources/Create
-__RequestVerificationToken=<csrf>
-Id=0
-IsEduResource=true
-SelectedUnitId=<SubjectId from MlutiLessonPlan>
-SelectedGoles=<Base64(JSON.stringify([]))>
-ActivityType=1
-Name=شرح الدرس (<lessonName>)
-Description=
-FileType=
-Link=
-hfLevelsCount=hfLevelsCount
-hfDrawTree=/MangeResources/DrawTreeToClassLesson
-SchoolId=<NUMERIC SchoolId from MlutiLessonPlan>
-This returns ProjectId directly → feeds LectureProjectsList → SaveLastLessonPlan succeeds.
+| Source | Status | Notes |
+|--------|--------|-------|
+| `/Teacher/LectureTools/GetProjectsList` (POST) | 500 Internal Server Error | Re-confirmed May 14 with fresh CSRF + schoolId payload |
+| `/Teacher/Lessons/GetActivitiesList` (POST) | 302 → /Errors/NotPermitted | Forbidden for teacher role |
+| `/Projects/Projects/Index/{schoolId}` (GET, HTML scrape) | 200 but unusable | Returns navbar/page shell only; no project IDs anywhere in HTML (~64K chars). All numeric tokens found are CSS/JS literals, not DB IDs |
+| `/Projects/Projects/Create` (POST) response | opaque redirect, success | Server creates Activity in DB but does NOT echo back ProjectId. Location header is null/unreadable due to CORS opaque-redirect type |
+| `/LearningResources/MangeResources/Create` (POST) | 200 but wrong content | Tested May 14 as parallel probe. Endpoint accepts the call but returns HTML for "إضافة إثراء" page (~148K), NOT JSON with ProjectId. No ProjectId/Id pattern matched in response body |
+| ManageLecture HTML scrape (for LectureProjectsList) | 0 candidates | HTML does not embed prior Activities for the lecture in any parseable form |
+
+### PROPOSED FIX (next session) — STATUS: REJECTED
+The previously-proposed migration from `/Projects/Projects/Create` to `/LearningResources/MangeResources/Create` was tested with a parallel diagnostic probe on May 14. The endpoint did NOT return a usable ProjectId in JSON form; it returned the HTML of the "إضافة إثراء" UI page instead. This approach is no longer being pursued.
 
 ### classroomId=0 issue
 When MlutiLessonPlan returns empty form → classroomId=0 → Save rejected.
 Fix: abort silentPrepareLesson if MlutiLessonPlan fields < 10.
+
+---
+
+## 📌 SESSION HANDOFF — May 14, 2026
+
+This section captures the state at the end of the current debugging session so a fresh chat can resume without rediscovering what's already known.
+
+### ✅ Wins this session
+
+#### 1. Quran subject lesson dropdown — FIXED (Hybrid strategy)
+- **Problem:** Subjects like "القرآن الكريم والدراسات الإسلامية" (subjectId 34347, 34355) were absent from `madrasati_courses_clean.json`. Dropdown rendered with only the "AI Auto-Pilot" entry.
+- **Root cause:** Local JSON snapshot covers 162 subjects only. Quran-family subjects are served live by Madrasati on demand.
+- **Solution implemented in `content.js`:** Two-tier hybrid in `fetchLessonTreeOptions`:
+  - Tier 1: Local lookup via `getLocalSubjectData` (fast path, unchanged).
+  - Tier 2: When local returns empty, call the live endpoint and normalize the response.
+- **New helper added:** `fetchGoalLessonSubjectLive(subjectId)`.
+- **Endpoint discovered and confirmed working:**
+  - URL: `POST /LearningResources/MangeResources/GetGoalLessonSubject`
+  - Body: `subjectId=<numeric>` (single field, x-www-form-urlencoded)
+  - Auth: session cookies only — no CSRF token required
+  - Response: JSON array `[{ LessonId, LessonTitle, TreeId, LessonIdCode, GoalId, GoalTitle, SelectedIndex }, ...]`
+- **Mapping applied:**
+  - `compositeId` = `${subjectId},${TreeId},${LessonId}`
+  - `chapterId` ← `TreeId`
+  - `lessonId` ← `LessonId`
+  - `name` ← `LessonTitle`
+- **Verified live:** subjectId 34347 → 437 lessons; subjectId 34355 → 448 lessons; both populated the dropdown correctly.
+- **A separate handoff doc was generated for the backend developer:** `QURAN_SUBJECT_FIX_HANDOFF.md`.
+
+### ❌ Still blocked: SaveLastLessonPlan validation failure
+
+#### Symptom
+- HTTP layer: `/Teacher/Lessons/SaveLastLessonPlan` returns 302 (treated as success). Console reports "تم تحضير 1 حصة بنجاح عبر الـ API".
+- DB / UI layer: After page refresh, the lecture card flips back to red and the UI shows "فشل التحضير، يتعين إضافة واجب أو إثراء أو نشاط".
+- Conclusion: the Activity row IS created in the DB, but it is NOT linked to the Lecture, because `LectureProjectsList[0].ProjectId` is empty in the save payload.
+
+#### What was tried this session (all failed)
+1. **Reading Activity POST Location header** — changed `redirect:'follow'` to `redirect:'manual'`. Response comes back as `opaqueredirect` type with no readable headers and `Location: null`.
+2. **Tier-A: POST `/Teacher/LectureTools/GetProjectsList`** — returns 500. Confirmed broken.
+3. **Tier-B: scrape `ManageLecture` HTML for `LectureProjectsList[*].ProjectId` hidden inputs** — HTML does not contain any such inputs after our save. 0 candidates found across all regex patterns tried.
+4. **Tier-C: scrape `/Projects/Projects/Index/{schoolId}` with broadened regex** — page returns the navbar/SPA shell only. The 10 numeric tokens found in the HTML are CSS values, z-index values, and template literals; none are real project IDs.
+5. **Parallel probe to `/LearningResources/MangeResources/Create`** — accepts the call but returns HTML of the "إضافة إثراء" form page (~148K), not JSON with ProjectId.
+
+#### Key facts confirmed
+- The Activity row IS being created server-side (Console: `Activity created: true`).
+- The Activity creation endpoint (`/Projects/Projects/Create`) returns 302 with an opaque redirect — `Location` is genuinely unreadable due to CORS rules for opaque-redirect fetches.
+- MlutiLessonPlan continues to work and yields NUMERIC SchoolId (`162189`) and TimeTableId (`17878002`).
+- The SaveLastLessonPlan flow itself works for any test where ProjectId is somehow provided — it is purely the ProjectId discovery that is unsolved.
+
+### 🔬 Hypotheses for the next session (in order of plausibility)
+
+#### Hypothesis A — Investigate the cookie / session-state side-effect
+The competitor extension may rely on `/Projects/Projects/Create` storing the new ProjectId in a session cookie or server-side session bag, then reading it back via a subsequent endpoint or by re-parsing a cookie. Inspect `document.cookie` BEFORE and AFTER the Activity POST to detect any new cookie set by the server.
+
+#### Hypothesis B — A different ManageLecture variant returns the linkage
+The current ManageLecture fetch uses `?SchoolId=...&subjectId=...&classroomId=...`. There may be a richer endpoint (e.g., `ManageLecture/Edit`, `ManageLecture/Details`, or a POST variant) that returns the lecture WITH its currently-attached activities embedded. The competitor's `MlutiLessonPlan` response — which currently gives us 61 form fields — may already contain a ProjectId field that we are not parsing. **Action: re-inspect the 61 fields returned by MlutiLessonPlan, looking for anything containing the word "Project".**
+
+#### Hypothesis C — Activity POST needs `redirect:'follow'` + URL parsing
+With `redirect:'follow'` (the original default), the browser silently follows the 302 and `saveRes.url` reflects the final URL after redirect. The final URL may contain the new ProjectId as a query param (e.g., `?activityId=...`). We switched to `redirect:'manual'` for diagnostics, but this hid `saveRes.url`. **Action: temporarily revert to `redirect:'follow'`, log `saveRes.url` carefully, and inspect for any numeric ID embedded in it.**
+
+#### Hypothesis D — Reverse-engineer the competitor's exact SaveLastLessonPlan payload
+We have not yet captured the competitor extension's actual SaveLastLessonPlan POST body when it succeeds. If we capture that body, we can see whether their `LectureProjectsList[0].ProjectId` is even being sent — and if so, where it came from. **This is the highest-leverage next step.** The 4MB obfuscated VM JS file is the source of truth, but a Network-tab capture of one successful save is far easier.
+
+### 📦 Tools & state on disk
+
+- `content.js` — contains the Hybrid Quran fix (working) and the layered ProjectId resolver (currently logging diagnostics, not yet resolving anything).
+- `madrasati_courses_clean.json` — unchanged, 162 subjects, no Quran. Now compensated for by the hybrid live fetch.
+- `background.js` — unchanged.
+- `ARCHITECTURE.md` — this file; updated this session.
+- `PLAN.md` — should be reviewed and synced separately.
+- `QURAN_SUBJECT_FIX_HANDOFF.md` — output of this session for the backend dev.
+
+### ▶️ Suggested opening prompt for the next session
+
+> "Read ARCHITECTURE.md, especially the SESSION HANDOFF — May 14 section. The Quran fix is done. The remaining blocker is acquiring the ProjectId for LectureProjectsList[0].ProjectId in the SaveLastLessonPlan payload. All previously-tried sources have failed (see the updated table). Start with Hypothesis D: capture the competitor extension's actual SaveLastLessonPlan POST body from a successful save and reverse-engineer where its ProjectId came from. Stay in diagnose-and-generate-prompts mode; do not edit content.js until the source of the ProjectId is identified."
