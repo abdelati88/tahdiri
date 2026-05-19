@@ -56,7 +56,8 @@
     var SAVE_SUBMITTED_AT_KEY = "automationSaveSubmittedAt";
     var AI_LESSON_DATA_KEY = "aiLessonData";
     var AUTOMATION_MODE_KEY = "automationMode";
-    var N8N_AI_WEBHOOK_URL = "https://n8n.abdelati88.shop/webhook/tahdiri-ai-generator";
+    var N8N_AI_WEBHOOK_URL = "https://n8n.qraura.shop/webhook/mo3een-ai-generator2";
+    var N8N_AI_API_KEY = "sk-mo3een-super-secret-2026";
     var ACTION_LOCK_PREFIX = "tahdiriActionLock";
     var STEP1_NEXT_LOCK_TTL_MS = 9e4;
     var FINAL_SAVE_LOCK_TTL_MS = 12e4;
@@ -1607,8 +1608,35 @@
         return false;
       }
 
-      // CRITICAL DB sync — the new row needs time to commit before GetProjectsList sees it.
-      await new Promise(r => setTimeout(r, 2000));
+      // CRITICAL DB sync — Madrasati's GetProjectsList lags 1-15s behind the
+      // Activity Create POST depending on server load. We poll up to 5 times
+      // with exponential backoff: 1s, 2s, 4s, 4s, 4s (≈15s worst case).
+      // Best case: 1 attempt, ~1s total (DB is fast).
+      // Worst case: 5 attempts, ~15s total (DB is slow, but we still succeed).
+      // After 5 failed attempts, fall through to Tier-B/Tier-C as before.
+      var _diffWaitSchedule = [1000, 2000, 4000, 4000, 4000];
+      var _diffAttempts = 0;
+      var _diffSucceeded = false;
+      for (var _attemptIdx = 0; _attemptIdx < _diffWaitSchedule.length; _attemptIdx++) {
+        await new Promise(r => setTimeout(r, _diffWaitSchedule[_attemptIdx]));
+        _diffAttempts++;
+        try {
+          var _probeSnapshot = await fetchProjectsListSnapshot('probe-' + _diffAttempts);
+          var _probeNewIds = [..._probeSnapshot].filter(id => !beforeSnapshot.has(id));
+          if (_probeNewIds.length > 0) {
+            console.log('[Tahdiri] ✅ DB sync probe attempt', _diffAttempts, 'detected', _probeNewIds.length, 'new project ID(s) after', _diffWaitSchedule.slice(0, _attemptIdx + 1).reduce(function (a, b) { return a + b; }, 0), 'ms total wait — proceeding to single Tier-A DIFF below');
+            _diffSucceeded = true;
+            break;
+          } else {
+            console.warn('[Tahdiri] ⏳ DB sync probe attempt', _diffAttempts, '— no new ID yet (size=' + _probeSnapshot.size + ', baseline=' + beforeSnapshot.size + '). Will retry.');
+          }
+        } catch (_probeErr) {
+          console.warn('[Tahdiri] DB sync probe attempt', _diffAttempts, 'threw:', _probeErr && _probeErr.message);
+        }
+      }
+      if (!_diffSucceeded) {
+        console.error('[Tahdiri] ❌ DB sync polling exhausted after', _diffAttempts, 'attempts. Tier-A DIFF will likely fail; falling through to Tier-B (HTML scrape) and Tier-C (Projects/Index).');
+      }
 
       // 3a. Call MlutiLessonPlan to get NUMERIC SchoolId + TimeTableId for SaveLastLessonPlan.
       // The `token` is the card's `data-data` encrypted blob. Posting it to MlutiLessonPlan
@@ -1965,6 +1993,26 @@
       finalForm.append('SelectedTrees_2', String(chapterId).trim());
       finalForm.append('SelectedTrees_3', String(lessonId).trim());
 
+      // CRITICAL: hfLevelsCount tells the server how many tree levels to bind from
+      // the form. The scraped value from MlutiLessonPlan/ManageLecture is "1"
+      // (only the subject is known to that page). We always send 3 levels
+      // (SubjectId / SelectedTrees_2 / SelectedTrees_3) so this MUST be "3".
+      // If it stays at "1", the server ignores SelectedTrees_2 and SelectedTrees_3,
+      // leaves the lesson dropdown unselected on re-open, and redirects the POST
+      // to ManageLecture (302) — which silentPrepareLesson interprets as failure.
+      // Use .set() to OVERRIDE the scraped value (not .append() which would duplicate it).
+      finalForm.set('hfLevelsCount', '3');
+      console.log('[Tahdiri] ✅ Forced hfLevelsCount=3 for SaveLastLessonPlan (was:', finalForm.getAll('hfLevelsCount').join(',') || 'unset', ')');
+
+      // ── Goals + Activities mirror IDs (the "digital content" checkboxes) ──
+      // PLACEHOLDER — extraction logic temporarily removed to restore working save flow.
+      // The checkboxes for "المحتوى الرقمي المرتبط بالدرس" will remain empty in the
+      // edit view until we re-implement extraction in a separate controlled experiment.
+      // The lesson plan ITSELF saves successfully (AI text content, strategies,
+      // teachingTools, lesson dropdown, all work). The competitor's behavior of
+      // pre-selecting all available checkboxes is a nice-to-have, not required.
+      console.log('[Tahdiri] Goals/activities binding skipped (placeholder).');
+
       // CRITICAL: Madrasati requires LessonType and LessonTempleateType — verified from competitor's
       // successful Save trace. Missing LessonType returns 400 with
       // "لا يمكن ترك حقل نوع الدرس فارغاً".
@@ -1985,13 +2033,107 @@
         'LessonType:', finalForm.get('LessonType'),
         'LessonTempleateType:', finalForm.get('LessonTempleateType'));
 
-      // Core content fields
-      finalForm.append('strategies', '4');
-      finalForm.append('ThinkingSkills', "التركيز والتحليل والملاحظة");
-      finalForm.append('LectureClassPreparationText', "تمهيد مناسب يربط الدرس بالخبرات السابقة.");
-      finalForm.append('LectureClassCloseText', "ملخص شامل لأهم نقاط الدرس.");
-      finalForm.append('LessonVocabulary', "المصطلحات والمفاهيم الأساسية الواردة.");
-      finalForm.append('TeacherNote', "متابعة أداء الطلاب وتقديم التغذية الراجعة.");
+      // Core content fields — pull AI-generated text from chrome.storage cache if available.
+      // Falls back to hardcoded defaults on any failure (timeout, missing cache, bad shape).
+      var aiCached = null;
+      try {
+        var aiCacheKey = 'tahdiri_ai_' + String(lessonId).trim();
+        aiCached = await new Promise(function (resolve) {
+          chrome.storage.local.get([aiCacheKey], function (r) { resolve(r[aiCacheKey] || null); });
+        });
+      } catch (e) {
+        console.warn('[Tahdiri-AI] silentPrepareLesson cache read failed:', e && e.message);
+      }
+
+      // Coerce any AI field shape (string | array of strings | array of objects | object)
+      // into a single clean Arabic string suitable for FormData.append().
+      // GPT-4o-mini occasionally returns LessonVocabulary as an array of objects which
+      // produces object text when FormData stringifies it.
+      function _aiToString(val, fallback) {
+        try {
+          if (val == null) return fallback;
+          if (typeof val === 'string') return val.trim() || fallback;
+          if (Array.isArray(val)) {
+            var parts = val.map(function (item) {
+              if (item == null) return '';
+              if (typeof item === 'string') return item.trim();
+              if (typeof item === 'object') {
+                // Prefer common term/meaning pairs; fall back to joining all values.
+                var keys = Object.keys(item);
+                if (keys.length === 0) return '';
+                // Build "<key1>: <val1>" if there's a recognizable pair
+                var termKey  = keys.find(function (k) { return /term|word|كلم|مصطلح/i.test(k); });
+                var meanKey  = keys.find(function (k) { return /mean|defin|شرح|معنى|تعريف/i.test(k); });
+                if (termKey && meanKey) {
+                  return String(item[termKey]).trim() + ': ' + String(item[meanKey]).trim();
+                }
+                // Generic fallback: join all primitive values
+                return keys.map(function (k) {
+                  var v = item[k];
+                  return (v == null || typeof v === 'object') ? '' : String(v).trim();
+                }).filter(Boolean).join(' — ');
+              }
+              return String(item).trim();
+            }).filter(Boolean);
+            var joined = parts.join(' • ');
+            return joined || fallback;
+          }
+          if (typeof val === 'object') {
+            // Plain object — join "key: value" pairs
+            var oParts = Object.keys(val).map(function (k) {
+              var v = val[k];
+              if (v == null || typeof v === 'object') return '';
+              return String(k).trim() + ': ' + String(v).trim();
+            }).filter(Boolean);
+            return oParts.length ? oParts.join(' • ') : fallback;
+          }
+          // Number / boolean / other primitive
+          return String(val).trim() || fallback;
+        } catch (e) {
+          console.warn('[Tahdiri-AI] aiToString error, using fallback:', e && e.message);
+          return fallback;
+        }
+      }
+
+      var aiPrep  = _aiToString(aiCached && aiCached.LectureClassPreparationText, "تمهيد مناسب يربط الدرس بالخبرات السابقة.");
+      var aiClose = _aiToString(aiCached && aiCached.LectureClassCloseText,       "ملخص شامل لأهم نقاط الدرس.");
+      var aiVocab = _aiToString(aiCached && aiCached.LessonVocabulary,            "المصطلحات والمفاهيم الأساسية الواردة.");
+      var aiThink = _aiToString(aiCached && aiCached.ThinkingSkills,              "التركيز والتحليل والملاحظة");
+      var aiNote  = _aiToString(aiCached && aiCached.TeacherNote,                 "متابعة أداء الطلاب وتقديم التغذية الراجعة.");
+
+      if (aiCached) {
+        console.log('[Tahdiri-AI] ✅ Normalized AI content for lesson', lessonId,
+          '| vocab len:', aiVocab.length,
+          '| prep len:', aiPrep.length);
+      }
+
+      if (aiCached) {
+        console.log('[Tahdiri-AI] ✅ Using AI content for lesson', lessonId);
+      } else {
+        console.log('[Tahdiri-AI] ⚠️ No AI cache for', lessonId, '— using defaults');
+      }
+
+      // Strategies + teachingTools — replicate competitor's exact payload pattern.
+      // FormData.append() with the same key multiple times produces the standard
+      // "strategies=2&strategies=4&strategies=5..." form-encoding that ASP.NET MVC
+      // binds to List<int> on the server side.
+      // IDs are static Madrasati checkbox values (verified from competitor_full.json HAR).
+      var TAHDIRI_DEFAULT_STRATEGIES = [2, 4, 5, 12, 19];
+      var TAHDIRI_DEFAULT_TEACHING_TOOLS = [1, 2, 3, 5, 8, 9, 11];
+
+      TAHDIRI_DEFAULT_STRATEGIES.forEach(function (id) {
+        finalForm.append('strategies', String(id));
+      });
+      TAHDIRI_DEFAULT_TEACHING_TOOLS.forEach(function (id) {
+        finalForm.append('teachingTools', String(id));
+      });
+      console.log('[Tahdiri] ✅ Appended', TAHDIRI_DEFAULT_STRATEGIES.length, 'strategies +', TAHDIRI_DEFAULT_TEACHING_TOOLS.length, 'teachingTools');
+
+      finalForm.append('ThinkingSkills', aiThink);
+      finalForm.append('LectureClassPreparationText', aiPrep);
+      finalForm.append('LectureClassCloseText', aiClose);
+      finalForm.append('LessonVocabulary', aiVocab);
+      finalForm.append('TeacherNote', aiNote);
 
       // Include the Activity so the server validation passes (requires at least one نشاط/واجب/إثراء).
       if (activityProjectId) {
@@ -2117,6 +2259,125 @@
       return result;
     }
 
+    // ── Prefetch AI content for a single lesson card and cache in chrome.storage.local ──
+    // Returns the AI object (5 fields) or null on failure. Cache key: tahdiri_ai_<lessonId>.
+    async function prefetchAILessonDataForCard(cardItem) {
+      try {
+        // Resolve lessonId the SAME WAY silentPrepareLesson does — by parsing
+        // selection.treeValue ("subjectId,chapterId,lessonId"). Direct `.lessonId`
+        // is NOT a property on selection.
+        var lessonId = '';
+        try {
+          var tv = cardItem && cardItem.selection && cardItem.selection.treeValue;
+          if (tv && typeof tv === 'string') {
+            var parts = tv.split(',');
+            if (parts.length >= 3) {
+              lessonId = String(parts[2]).trim();
+            }
+          }
+        } catch (e) {
+          console.warn('[Tahdiri-AI] prefetch: error parsing treeValue:', e && e.message);
+        }
+        if (!lessonId) {
+          console.warn('[Tahdiri-AI] prefetch skipped — could not parse lessonId from treeValue:', cardItem && cardItem.selection && cardItem.selection.treeValue);
+          return null;
+        }
+        console.log('[Tahdiri-AI] prefetch: resolved lessonId', lessonId, 'from treeValue');
+        var cacheKey = 'tahdiri_ai_' + lessonId;
+
+        // 1. Try cache first
+        var cached = await new Promise(function (resolve) {
+          chrome.storage.local.get([cacheKey], function (r) { resolve(r[cacheKey] || null); });
+        });
+        if (cached && cached.LectureClassPreparationText) {
+          console.log('[Tahdiri-AI] ✅ cache hit for', lessonId);
+          return cached;
+        }
+
+        // 2. Build context from the SAME canonical sources used elsewhere in the file:
+        //    - lessonName: from selection.treeText (matches silentPrepareLesson line 1571)
+        //    - subjectName: from <h2> inside card div (matches dashboard dropdown builder line 1218-1219)
+        //    - gradeName: scraped from page (breadcrumb / sidebar / header). Best-effort; AI tolerates empty grade.
+        var div = cardItem && cardItem.div ? cardItem.div : null;
+        var lessonName = '';
+        try {
+          var tt = cardItem && cardItem.selection && cardItem.selection.treeText;
+          if (tt && typeof tt === 'string') {
+            lessonName = tt.trim().replace(/:$/, '').trim();
+          }
+        } catch (_) { }
+
+        var subjectName = '';
+        try {
+          if (div) {
+            var h2 = div.querySelector('h2');
+            if (h2) subjectName = (h2.innerText || h2.textContent || '').trim();
+          }
+        } catch (_) { }
+
+        var gradeName = '';
+        // The grade is not in the dashboard card DOM and not in our local JSON.
+        // We will resolve it later inside silentPrepareLesson by parsing the
+        // ManageLecture HTML breadcrumb, then write it back to the AI cache.
+        // For the prefetch context we send to n8n RIGHT NOW, we leave it empty —
+        // the AI tolerates empty grade and still produces high-quality content
+        // because it has subject + lesson_title.
+        // (Future optimization: pre-fetch ManageLecture HTML in parallel before
+        // the AI call so we can pass grade on the first attempt.)
+
+        console.log('[Tahdiri-AI] prefetch context →',
+          'grade:', JSON.stringify(gradeName),
+          '| subject:', JSON.stringify(subjectName),
+          '| lesson_title:', JSON.stringify(lessonName));
+
+        if (!lessonName && !subjectName) {
+          console.warn('[Tahdiri-AI] prefetch skipped — both lessonName and subjectName are empty for lessonId', lessonId);
+          return null;
+        }
+
+        // 3. Call n8n
+        // 60s timeout — GPT-4o-mini for long Arabic content routinely takes 8-15s
+        var controller = new AbortController();
+        var timeoutId = setTimeout(function () { controller.abort(); }, 60000);
+        var res = await fetch(N8N_AI_WEBHOOK_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': N8N_AI_API_KEY
+          },
+          body: JSON.stringify({
+            grade: gradeName,
+            subject: subjectName,
+            lesson_title: lessonName
+          }),
+          signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+
+        if (!res.ok) {
+          console.warn('[Tahdiri-AI] prefetch HTTP', res.status, 'for', lessonId);
+          return null;
+        }
+        var data = await res.json();
+        if (!data || typeof data !== 'object' || !data.LectureClassPreparationText) {
+          console.warn('[Tahdiri-AI] prefetch: invalid response shape for', lessonId);
+          return null;
+        }
+
+        // 4. Cache and return
+        await new Promise(function (resolve) {
+          var payload = {};
+          payload[cacheKey] = data;
+          chrome.storage.local.set(payload, resolve);
+        });
+        console.log('[Tahdiri-AI] ✅ prefetched + cached', lessonId);
+        return data;
+      } catch (err) {
+        console.warn('[Tahdiri-AI] prefetch error:', err && err.message);
+        return null;
+      }
+    }
+
     async function handleDashboardSave() {
       var allSelects = document.querySelectorAll('.tahdiri-dashboard-select');
       var tokensToPrepare = [];
@@ -2186,6 +2447,17 @@
       if (typeof silentPrepareLesson !== 'function') {
         updateDashboardStatus("❌ خطأ: دالة silentPrepareLesson غير موجودة بالكود!", "error");
         return;
+      }
+      // ── Parallel pre-fetch AI content for ALL cards before the save loop ──
+      // Fires all n8n requests concurrently. Each result is cached per-lesson in
+      // chrome.storage.local. silentPrepareLesson reads from that cache. Failures
+      // are silent — the save loop falls back to hardcoded defaults.
+      updateDashboardStatus("⏳ جاري توليد محتوى الذكاء الاصطناعي لـ " + tokensToPrepare.length + " درس...", "info");
+      try {
+        await Promise.all(tokensToPrepare.map(function (c) { return prefetchAILessonDataForCard(c); }));
+        console.log('[Tahdiri-AI] ✅ Parallel prefetch complete for', tokensToPrepare.length, 'lessons');
+      } catch (e) {
+        console.warn('[Tahdiri-AI] Parallel prefetch had errors (continuing with defaults):', e && e.message);
       }
       for (var item of tokensToPrepare) {
         try {
@@ -2522,17 +2794,23 @@
     async function fetchAILessonData(context) {
       try {
         log("fetchAILessonData: sending to n8n:", context);
+        // 60s timeout — GPT-4o-mini for long Arabic content routinely takes 8-15s
+        var controller = new AbortController();
+        var timeoutId = setTimeout(function () { controller.abort(); }, 60000);
         var response = await fetch(N8N_AI_WEBHOOK_URL, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": N8N_AI_API_KEY
+          },
           body: JSON.stringify({
             grade: context.grade,
             subject: context.subject,
-            lessonTitle: context.lessonTitle,
-            availableStrategies: context.availableStrategies || [],
-            availableTools: context.availableTools || []
-          })
+            lesson_title: context.lessonTitle
+          }),
+          signal: controller.signal
         });
+        clearTimeout(timeoutId);
         if (!response.ok) {
           log("fetchAILessonData: HTTP error", response.status);
           return null;
