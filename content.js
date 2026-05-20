@@ -1606,6 +1606,149 @@
       }
     }
 
+    function parseMadrasatiResourceDateValue(value) {
+      const s = String(value || '').trim();
+      if (!s) return null;
+      let m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{1,2}):(\d{1,2})(?:\s*(AM|PM))?$/i);
+      if (m) {
+        let hour = Number(m[4]);
+        const ampm = (m[7] || '').toUpperCase();
+        if (ampm === 'PM' && hour < 12) hour += 12;
+        if (ampm === 'AM' && hour === 12) hour = 0;
+        const d = new Date(Number(m[3]), Number(m[1]) - 1, Number(m[2]), hour, Number(m[5]), Number(m[6]));
+        return isNaN(d.getTime()) ? null : d;
+      }
+      m = s.match(/^(\d{4})[/-](\d{1,2})[/-](\d{1,2})/);
+      if (m) {
+        const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 8, 0, 0);
+        return isNaN(d.getTime()) ? null : d;
+      }
+      const parsed = new Date(s);
+      return isNaN(parsed.getTime()) ? null : parsed;
+    }
+
+    function formatMadrasatiResourceDateValue(d) {
+      const month = d.getMonth() + 1;
+      const day = d.getDate();
+      const year = d.getFullYear();
+      let hour = d.getHours();
+      const min = String(d.getMinutes()).padStart(2, '0');
+      const sec = String(d.getSeconds()).padStart(2, '0');
+      const ampm = hour >= 12 ? 'PM' : 'AM';
+      hour = hour % 12;
+      if (hour === 0) hour = 12;
+      return month + '/' + day + '/' + year + ' ' + hour + ':' + min + ':' + sec + ' ' + ampm;
+    }
+
+    function formatGregorianYmd(d) {
+      const month = String(d.getMonth() + 1).padStart(2, '0');
+      const day = String(d.getDate()).padStart(2, '0');
+      return d.getFullYear() + '/' + month + '/' + day;
+    }
+
+    function addDays(date, days) {
+      return new Date(date.getTime() + Number(days || 0) * 24 * 60 * 60 * 1000);
+    }
+
+    function injectHomeworkIntoPageState(assignmentId, attachData, options) {
+      const payload = {
+        assignmentId: String(assignmentId || ''),
+        grade: String((options && options.grade) || '1'),
+        assignmentName: String((options && options.assignmentName) || 'واجب'),
+        assignmentType: String((attachData && attachData.assignmentType) || (options && options.assignmentType) || '1'),
+        dayCount: String((options && options.dayCount) || '3'),
+        timeTableId: String((options && options.timeTableId) || ''),
+        startDateTime: String((attachData && attachData.startDateTime) || (options && options.startDateTime) || ''),
+        endDateTime: String((attachData && attachData.endDateTime) || (options && options.endDateTime) || ''),
+        startDateTimeHijri: String((attachData && attachData.startDateTimeHijri) || ''),
+        endDateTimeHijri: String((attachData && attachData.endDateTimeHijri) || ''),
+        isGradeBook: attachData && attachData.isGradeBook != null ? attachData.isGradeBook : true,
+        assignmentIdEnc: String((attachData && attachData.assignmentIdEnc) || '')
+      };
+      if (!payload.assignmentId) return false;
+      try {
+        const script = document.createElement('script');
+        script.textContent =
+          '(function(payload){try{' +
+          'var list=null;' +
+          'if(typeof listOfAssignments!=="undefined"&&Array.isArray(listOfAssignments)){list=listOfAssignments;}' +
+          'else if(Array.isArray(window.listOfAssignments)){list=window.listOfAssignments;}' +
+          'if(list){' +
+          'var exists=list.some(function(x){return String(x&&x.assignmentId)===String(payload.assignmentId);});' +
+          'if(!exists){list.push({' +
+          'assignmentId:payload.assignmentId,grade:payload.grade,assignmentName:payload.assignmentName,' +
+          'startDateTime:payload.startDateTime,endDateTime:payload.endDateTime,' +
+          'startDateTimeHijri:payload.startDateTimeHijri,endDateTimeHijri:payload.endDateTimeHijri,' +
+          'isGradeBook:payload.isGradeBook,assignmentIdEnc:payload.assignmentIdEnc,' +
+          'assignmentType:payload.assignmentType,DayCount:payload.dayCount,TimeTableIds:payload.timeTableId?[{timeTableId:payload.timeTableId,slot:"",date:"",classroom:""}]:[]' +
+          '});}' +
+          '}' +
+          'if(typeof loadAssignmentsList==="function"){try{loadAssignmentsList();}catch(_){}}' +
+          'console.log("[Tahdiri] Page listOfAssignments injected -> AssignmentId:",payload.assignmentId,"list:",list&&list.length);' +
+          '}catch(e){console.warn("[Tahdiri] Page listOfAssignments injection failed:",e&&e.message);}})(' +
+          JSON.stringify(payload).replace(/</g, '\\u003c') +
+          ');';
+        (document.documentElement || document.head || document.body).appendChild(script);
+        script.remove();
+        return true;
+      } catch (e) {
+        console.warn('[Tahdiri] Could not inject homework into page state:', e && e.message);
+        return false;
+      }
+    }
+
+    async function silentAttachHomeworkToLecture(options) {
+      const settings = options || {};
+      const assignmentId = String(settings.assignmentId || '').trim();
+      if (!assignmentId) return { ok: false, data: null, status: 0, message: 'missing assignmentId' };
+
+      const startRaw = String(settings.startDateRaw || getFieldValue('#StartDate') || '').trim();
+      const startDate = parseMadrasatiResourceDateValue(startRaw) || new Date();
+      const dayCount = String(settings.dayCount || '3');
+      const endDate = parseMadrasatiResourceDateValue(settings.endDateRaw) || addDays(startDate, Number(dayCount) || 3);
+      const isMulti = settings.isMulti === true || String(settings.isMulti || '').toLowerCase() === 'true';
+      const schoolId = String(settings.schoolId || getNumericSchoolIdValue() || '').trim();
+      const subjectId = String(settings.subjectId || getFieldValue('#SelectedUnitId') || '').trim();
+      const timeTableId = String(settings.timeTableId || getFieldValue('#TimeTableId') || '').trim();
+
+      const body = new URLSearchParams();
+      body.set('assignmentId', assignmentId);
+      body.set('StartDate', startRaw || formatMadrasatiResourceDateValue(startDate));
+      body.set('SchoolId', schoolId);
+      body.set('sDate', isMulti ? '' : formatGregorianYmd(startDate));
+      body.set('eDate', isMulti ? '' : formatGregorianYmd(endDate));
+      body.set('isGradeBook', settings.isGradeBook === false ? 'false' : 'true');
+      body.set('assignmentType', String(settings.assignmentType || '1'));
+      body.set('DayCount', dayCount);
+      body.set('selectedUnitId', subjectId);
+      body.set('TimeTableId', timeTableId);
+
+      try {
+        console.log('[Tahdiri] AddAssignmentToLecture POST → AssignmentId:', assignmentId, 'SchoolId:', schoolId, 'TimeTableId:', timeTableId, 'isMulti:', isMulti);
+        const res = await fetch('/Teacher/LectureTools/AddAssignmentToLecture', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            'X-Requested-With': 'XMLHttpRequest'
+          },
+          body: body.toString()
+        });
+        const text = await res.text();
+        let data = null;
+        try { data = text ? JSON.parse(text) : null; } catch (_) {}
+        if (!res.ok) {
+          console.warn('[Tahdiri] AddAssignmentToLecture failed status', res.status, 'body:', text.slice(0, 240));
+          return { ok: false, data: data, status: res.status, message: text.slice(0, 240) };
+        }
+        console.log('[Tahdiri] AddAssignmentToLecture accepted → AssignmentId:', assignmentId, 'response:', data || text.slice(0, 160));
+        return { ok: true, data: data || {}, status: res.status, message: '' };
+      } catch (e) {
+        console.warn('[Tahdiri] AddAssignmentToLecture threw:', e && e.message);
+        return { ok: false, data: null, status: 0, message: e && e.message };
+      }
+    }
+
     // ── Session 3: Homework / Assignment (واجب) silent API creation ────────────────
     // Flow: before-snapshot → AddQuestionListPaging (get IEN question IDs) → Manage POST
     //       → poll GetAssignmentsList until DIFF exposes the new AssignmentId.
@@ -1681,10 +1824,12 @@
         // capture showed ~30s, so poll longer than the activity path.
         const waitSchedule = [1000, 2000, 4000, 4000, 5000, 5000, 5000, 5000, 5000];
         let waitedMs = 0;
+        let latestSnap = new Set();
         for (let i = 0; i < waitSchedule.length; i++) {
           await new Promise(function (r) { setTimeout(r, waitSchedule[i]); });
           waitedMs += waitSchedule[i];
           const afterSnap = await _hwSnapshot('after-probe-' + (i + 1));
+          latestSnap = afterSnap;
           const newIds = [...afterSnap].filter(function (id) { return !beforeSnap.has(id); });
           if (newIds.length === 1) {
             console.log('[Tahdiri] ✅ Homework DIFF SUCCESS — AssignmentId:', newIds[0], 'after', waitedMs, 'ms');
@@ -1696,6 +1841,11 @@
             return picked;
           }
           console.warn('[Tahdiri] ⏳ Homework DIFF probe', i + 1, 'found no new assignment yet (before=' + beforeSnap.size + ', after=' + afterSnap.size + ').');
+        }
+        if (beforeSnap.size === 0 && latestSnap.size > 0) {
+          const picked = _pickNewestAssignmentId(latestSnap);
+          console.warn('[Tahdiri] Homework DIFF timed out, but scoped list now has assignment(s); using newest:', picked);
+          return picked;
         }
         return '';
       }
@@ -1847,6 +1997,7 @@
         console.error('[Tahdiri] Homework: no CSRF token — aborting');
         return '';
       }
+      let manageResponseAssignmentId = '';
 
       // 3. AddQuestionListPaging → fetch first IEN question ID available for this lesson
       //    Payload mirrors the competitor HAR exactly (note: "eschoolId" not "schoolId"!)
@@ -1924,14 +2075,17 @@
       _setManage('Name',           'واجب (' + lessonName + ')');
       _setManage('QuranLessonType', '1');
       _setManage('QuranLessonId',  '');
-      _setManage('AssignmentType', '3');
+      // Use IEN question-bank type (3) only when questions are available;
+      // fall back to traditional assignment type (1) when the bank is empty.
+      const _useIen = questionIds.length > 0;
+      _setManage('AssignmentType', _useIen ? '3' : '1');
       manageBody.append('',        '');  // Madrasati quirk: empty key+value pair
-      _setManage('Description',    '');
+      _setManage('Description',    _useIen ? '' : 'قم بحل أسئلة الدرس المحددة من كتاب الطالب وتسليم الإجابة داخل النظام.');
       _setManage('filePath',       '');
-      _setManage('PageNumber',     '');
-      _setManage('QuestionsNumber', '');
-      _setManage('SolvingType',    '4');
-      _setManage('AccessType',     'True');
+      _setManage('PageNumber',     _useIen ? '' : '13');
+      _setManage('QuestionsNumber', _useIen ? '' : '1');
+      _setManage('SolvingType',    _useIen ? '4' : '2');
+      _setManage('AccessType',     _useIen ? 'True' : 'False');
       _setManage('schoolId',       schoolId);
       _setManage('hfLevelsCount',  '3');
       _setManage('hfDrawTree',     manageBody.get('hfDrawTree') || '/Teacher/Assignments/DrawTreeToClassLesson');
@@ -1967,7 +2121,18 @@
         if (!manageRes.ok) {
           console.warn('[Tahdiri] Homework: Manage POST status', manageRes.status); return '';
         }
-        console.log('[Tahdiri] Homework Manage POST accepted (status', manageRes.status + ')');
+        const manageIdMatch = manageText.match(/(?:AssignmentId|assignmentId)["':=\s]+(\d{6,12})/i)
+          || manageText.match(/assignmentId_(\d{6,12})/i)
+          || manageText.match(/checkAssignment\(\s*this\s*,\s*(\d{6,12})\s*\)/i);
+        const urlIdMatch = (manageRes.url || '').match(/[?&](?:assignmentId|IdEnc)=([A-Za-z0-9]{6,})/i);
+        if (manageIdMatch && manageIdMatch[1]) {
+          manageResponseAssignmentId = String(manageIdMatch[1]);
+          console.log('[Tahdiri] Homework Manage response exposed AssignmentId:', manageResponseAssignmentId, '— waiting for GetAssignmentsList confirmation before linking.');
+        } else if (urlIdMatch && /^\d{6,12}$/.test(urlIdMatch[1])) {
+          manageResponseAssignmentId = String(urlIdMatch[1]);
+          console.log('[Tahdiri] Homework Manage redirect URL exposed AssignmentId:', manageResponseAssignmentId);
+        }
+        console.log('[Tahdiri] Homework Manage POST accepted (status', manageRes.status + ')' + (_useIen ? ' [IEN]' : ' [type-1]'));
       } catch (e) {
         console.error('[Tahdiri] Homework: Manage POST failed', e); return '';
       }
@@ -1975,6 +2140,10 @@
       // 5. Poll GetAssignmentsList until the new AssignmentId appears, then link it.
       const assignmentId = await _waitForNewHomeworkId(beforeSnap);
       if (!assignmentId) {
+        if (manageResponseAssignmentId) {
+          console.warn('[Tahdiri] Homework: DIFF did not expose the new assignment, using Manage response AssignmentId fallback:', manageResponseAssignmentId);
+          return manageResponseAssignmentId;
+        }
         console.warn('[Tahdiri] Homework: DIFF found no new assignment IDs after polling (DB lag or creation rejected)');
         return '';
       }
@@ -2992,6 +3161,17 @@
         });
       }
 
+      function firstFormValueMatching(form, pattern) {
+        for (const key of form.keys()) {
+          pattern.lastIndex = 0;
+          if (!pattern.test(String(key))) continue;
+          pattern.lastIndex = 0;
+          const value = String(form.get(key) || '').trim();
+          if (value) return value;
+        }
+        return '';
+      }
+
       let startDate = parseMadrasatiDate(rawLectureStart);
       if (!startDate) {
         console.warn('[Tahdiri] Resource lists: could not parse lecture StartDate; using now() as fallback. raw=', JSON.stringify(rawLectureStart));
@@ -3004,16 +3184,47 @@
       const startTimeStr = fmtProjectTime(startDate);
       const endTimeStr   = fmtProjectTime(endDate);
 
-      // MlutiLessonPlan / ManageLecture can carry stale or empty resource rows.
-      // Clear them before appending the IDs created in this run so ASP.NET binds
-      // the actual AssignmentId/ExamId/ProjectId, not an earlier blank value.
-      deleteFormDataPrefix(finalForm, 'LectureProjectsList[');
-      deleteFormDataPrefix(finalForm, 'LectureAssignmentsList[');
-      deleteFormDataPrefix(finalForm, 'LectureExamsList[');
+      const formProjectId = firstFormValueMatching(finalForm, /^LectureProjectsList\[\d+\]\.ProjectId$/);
+      const formAssignmentId = firstFormValueMatching(finalForm, /^LectureAssignmentsList\[\d+\]\.AssignmentId$/);
+      const formExamId = firstFormValueMatching(finalForm, /^LectureExamsList\[\d+\]\.ExamId$/);
+      const resolvedProjectId = activityProjectId || formProjectId;
+      const resolvedAssignmentId = homeworkAssignmentId || formAssignmentId;
+      const resolvedExamId = examId || formExamId;
+      let homeworkAttachData = null;
+
+      if (resolvedAssignmentId) {
+        const attachResult = await silentAttachHomeworkToLecture({
+          assignmentId: resolvedAssignmentId,
+          subjectId: String(finalSubjectId).trim(),
+          schoolId: String(finalForm.get('SchoolId') || '').trim(),
+          timeTableId: String(finalForm.get('TimeTableId') || finalTimeTableId || '').trim(),
+          startDateRaw: rawLectureStart,
+          endDateRaw: finalForm.get('MultiPrepareLesson[0].EndDate') || finalForm.get('EndDate') || '',
+          isMulti: false,
+          dayCount: '3',
+          assignmentType: '1',
+          isGradeBook: true
+        });
+        if (attachResult.ok) {
+          homeworkAttachData = attachResult.data || {};
+          injectHomeworkIntoPageState(resolvedAssignmentId, homeworkAttachData, {
+            grade: '1',
+            assignmentName: 'واجب (' + lessonName + ')',
+            assignmentType: '1',
+            dayCount: '3',
+            timeTableId: String(finalForm.get('TimeTableId') || finalTimeTableId || '').trim(),
+            startDateTime: homeworkAttachData.startDateTime || startTimeStr,
+            endDateTime: homeworkAttachData.endDateTime || endTimeStr
+          });
+        } else {
+          console.warn('[Tahdiri] Homework AddAssignmentToLecture attach failed; SaveLastLessonPlan payload will still include AssignmentId:', resolvedAssignmentId, 'reason:', attachResult.message);
+        }
+      }
 
       // Include the Activity so the server validation passes (requires at least one نشاط/واجب/إثراء).
-      if (activityProjectId) {
-        finalForm.append('LectureProjectsList[0].ProjectId', activityProjectId);
+      if (resolvedProjectId) {
+        deleteFormDataPrefix(finalForm, 'LectureProjectsList[');
+        finalForm.append('LectureProjectsList[0].ProjectId', resolvedProjectId);
         finalForm.append('LectureProjectsList[0].Grade', '1');
         finalForm.append('LectureProjectsList[0].StartTime', startTimeStr);
         finalForm.append('LectureProjectsList[0].EndTime', endTimeStr);
@@ -3021,7 +3232,7 @@
         finalForm.append('LectureProjectsList[0].DayCount', '3');
 
         console.log('[Tahdiri] LectureProjectsList[0] →',
-          'ProjectId:', activityProjectId,
+          'ProjectId:', resolvedProjectId,
           'StartTime:', startTimeStr,
           'EndTime:', endTimeStr);
       } else {
@@ -3029,23 +3240,28 @@
       }
 
       // ── LectureAssignmentsList (Homework) ─────────────────────────────────────────
-      if (homeworkAssignmentId) {
-        finalForm.append('LectureAssignmentsList[0].AssignmentId', homeworkAssignmentId);
+      if (resolvedAssignmentId) {
+        const assignmentStartTime = homeworkAttachData && homeworkAttachData.startDateTime ? String(homeworkAttachData.startDateTime) : startTimeStr;
+        const assignmentEndTime = homeworkAttachData && homeworkAttachData.endDateTime ? String(homeworkAttachData.endDateTime) : endTimeStr;
+        const assignmentGradeBook = homeworkAttachData && homeworkAttachData.isGradeBook != null ? String(homeworkAttachData.isGradeBook) : 'true';
+        deleteFormDataPrefix(finalForm, 'LectureAssignmentsList[');
+        finalForm.append('LectureAssignmentsList[0].AssignmentId', resolvedAssignmentId);
         finalForm.append('LectureAssignmentsList[0].Grade',       '1');
-        finalForm.append('LectureAssignmentsList[0].IsGradeBook', 'true');
-        finalForm.append('LectureAssignmentsList[0].StartTime',   startTimeStr);
-        finalForm.append('LectureAssignmentsList[0].EndTime',     endTimeStr);
+        finalForm.append('LectureAssignmentsList[0].IsGradeBook', assignmentGradeBook);
+        finalForm.append('LectureAssignmentsList[0].StartTime',   assignmentStartTime);
+        finalForm.append('LectureAssignmentsList[0].EndTime',     assignmentEndTime);
         finalForm.append('LectureAssignmentsList[0].DayCount',    '3');
-        console.log('[Tahdiri] LectureAssignmentsList[0] → AssignmentId:', homeworkAssignmentId, 'StartTime:', startTimeStr, 'EndTime:', endTimeStr);
+        console.log('[Tahdiri] LectureAssignmentsList[0] → AssignmentId:', resolvedAssignmentId, 'StartTime:', assignmentStartTime, 'EndTime:', assignmentEndTime);
       } else {
         console.warn('[Tahdiri] No homeworkAssignmentId — LectureAssignmentsList omitted from SaveLastLessonPlan.');
       }
 
       // ── LectureExamsList (Exam) ───────────────────────────────────────────────
-      if (examId) {
+      if (resolvedExamId) {
+        deleteFormDataPrefix(finalForm, 'LectureExamsList[');
         const examEndDate = new Date(startDate.getTime() + 5 * 24 * 60 * 60 * 1000);
         const examEndStr  = fmtProjectTime(examEndDate);
-        finalForm.append('LectureExamsList[0].ExamId',      examId);
+        finalForm.append('LectureExamsList[0].ExamId',      resolvedExamId);
         finalForm.append('LectureExamsList[0].Duration',    '20');
         finalForm.append('LectureExamsList[0].Grade',       '5');
         finalForm.append('LectureExamsList[0].IsGradeBook', 'false');
@@ -3053,10 +3269,15 @@
         finalForm.append('LectureExamsList[0].StartTime',   startTimeStr);
         finalForm.append('LectureExamsList[0].EndTime',     examEndStr);
         finalForm.append('LectureExamsList[0].DayCount',    '5');
-        console.log('[Tahdiri] LectureExamsList[0] → ExamId:', examId);
+        console.log('[Tahdiri] LectureExamsList[0] → ExamId:', resolvedExamId);
       } else {
         console.warn('[Tahdiri] No examId — LectureExamsList omitted from SaveLastLessonPlan.');
       }
+
+      console.log('[Tahdiri] Resource list final payload →',
+        'ProjectId:', finalForm.get('LectureProjectsList[0].ProjectId') || '',
+        'AssignmentId:', finalForm.get('LectureAssignmentsList[0].AssignmentId') || '',
+        'ExamId:', finalForm.get('LectureExamsList[0].ExamId') || '');
 
       try {
         const saveRes = await fetch("https://schools.madrasati.sa/Teacher/Lessons/SaveLastLessonPlan", {
@@ -3752,19 +3973,41 @@
     function getCsrfToken() {
       return getFieldValue("#csrfid") || getFieldValue('input[name="__RequestVerificationToken"]');
     }
+    function getNumericSchoolIdValue(root) {
+      const scopes = [root || document, document];
+      const selectorCandidates = [
+        '#SchoolId',
+        'input[name="SchoolId"]',
+        'input[name="schoolId"]',
+        'input#schoolId'
+      ];
+      for (const scope of scopes) {
+        for (const selector of selectorCandidates) {
+          const value = getFieldValue(selector, scope);
+          if (/^\d+$/.test(value)) return value;
+        }
+      }
+      return '';
+    }
     function getSchoolIdValue(root) {
+      const candidates = [];
+      function remember(value) {
+        const s = String(value || "").trim();
+        if (s && !candidates.includes(s)) candidates.push(s);
+      }
+
       const scopes = [root || document, document];
       const selectorCandidates = [
         "#hSchoolId",
         'input[name="schoolId"]',
         "input#schoolId",
+        'input[name="SchoolId"]',
         'input[name="SchoolIdEnc"]',
         'input[name="eschoolId"]'
       ];
       for (const scope of scopes) {
         for (const selector of selectorCandidates) {
-          const value = getFieldValue(selector, scope);
-          if (value) return value;
+          remember(getFieldValue(selector, scope));
         }
       }
       const globalCandidates = [
@@ -3773,9 +4016,7 @@
         globalThis.SchoolIdEnc
       ];
       for (const candidate of globalCandidates) {
-        if (typeof candidate === "string" && candidate.trim()) {
-          return candidate.trim();
-        }
+        remember(candidate);
       }
       const hrefSources = [
         getFieldValue("#hfDrawTree"),
@@ -3783,9 +4024,28 @@
         getFieldValue("#hfGradeBookTotalValue")
       ].filter(Boolean);
       for (const href of hrefSources) {
-        const match = href.match(/\/Index\/([^/?#]+)/i);
-        if (match && match[1]) return match[1].trim();
+        remember(href);
+        const indexMatch = href.match(/\/Index\/([^/?#]+)/i);
+        if (indexMatch && indexMatch[1]) remember(indexMatch[1]);
+        const queryMatch = href.match(/[?&](?:schoolId|eschoolId|SchoolId)=([^&#]+)/i);
+        if (queryMatch && queryMatch[1]) {
+          try {
+            remember(decodeURIComponent(queryMatch[1]));
+          } catch {
+            remember(queryMatch[1]);
+          }
+        }
       }
+      const hashCandidate = candidates.find(function (value) {
+        return /^[a-f0-9]{32}$/i.test(value);
+      });
+      if (hashCandidate) return hashCandidate;
+      const embeddedHashCandidate = candidates.map(function (value) {
+        const m = value.match(/[a-f0-9]{32}/i);
+        return m ? m[0] : "";
+      }).find(Boolean);
+      if (embeddedHashCandidate) return embeddedHashCandidate;
+      if (candidates.length) return candidates[0];
       return "";
     }
     function matchesLessonRequirementError(text) {
@@ -3936,6 +4196,7 @@
       if (hasInjectedFallbackResource && !settings.force) {
         return buildResult(true, "Fallback resource already created");
       }
+      const beforeCounts = getLessonResourceCounts();
       const csrfToken = getCsrfToken();
       const schoolId = getSchoolIdValue();
       const unitId = getFieldValue("#SelectedUnitId");
@@ -3947,6 +4208,130 @@
       if (!csrfToken || !schoolId || !unitId || !tree2 || !tree3) {
         return buildResult(false, "Missing lesson identifiers for assignment fallback");
       }
+
+      function formatResourceDate(d) {
+        const month = d.getMonth() + 1;
+        const day = d.getDate();
+        const year = d.getFullYear();
+        let hour = d.getHours();
+        const min = String(d.getMinutes()).padStart(2, "0");
+        const sec = String(d.getSeconds()).padStart(2, "0");
+        const ampm = hour >= 12 ? "PM" : "AM";
+        hour = hour % 12;
+        if (hour === 0) hour = 12;
+        return `${month}/${day}/${year} ${hour}:${min}:${sec} ${ampm}`;
+      }
+
+      function parseResourceDate(value) {
+        const s = String(value || "").trim();
+        let m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{1,2}):(\d{1,2})$/);
+        if (m) {
+          const d = new Date(Number(m[3]), Number(m[1]) - 1, Number(m[2]), Number(m[4]), Number(m[5]), Number(m[6]));
+          return isNaN(d.getTime()) ? null : d;
+        }
+        m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+        if (m) {
+          const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 8, 0, 0);
+          return isNaN(d.getTime()) ? null : d;
+        }
+        return null;
+      }
+
+      function injectAssignmentIntoCurrentForm(assignmentId, attachData) {
+        const forms = Array.from(document.querySelectorAll("form"));
+        let saveForm = null;
+        try {
+          const saveButton = typeof findFinalSaveButtonSync === "function" ? findFinalSaveButtonSync() : null;
+          saveForm = saveButton && typeof saveButton.closest === "function" ? saveButton.closest("form") : null;
+        } catch {
+          saveForm = null;
+        }
+        const form = saveForm || forms.map(function (f) {
+          let score = 0;
+          if (isTrulyVisible(f)) score += 4;
+          if (f.querySelector('textarea[name], textarea[id]')) score += 10;
+          if (f.querySelector('input[name="TimeTableId"]')) score += 8;
+          if (f.querySelector('input[name="LectureClassPreparationText"], textarea[name="LectureClassPreparationText"], #LectureClassPreparationText')) score += 8;
+          if (f.querySelector('input[name="TeacherNote"], textarea[name="TeacherNote"], #TeacherNote')) score += 4;
+          if (f.querySelector('input[name="__RequestVerificationToken"]')) score += 2;
+          return { form: f, score: score };
+        }).sort(function (a, b) {
+          return b.score - a.score;
+        }).filter(function (entry) {
+          return entry.score > 0;
+        })[0]?.form || forms[0];
+        if (!form) return false;
+
+        Array.from(form.querySelectorAll('input[name]')).forEach(function (input) {
+          if (String(input.name || "").indexOf("LectureAssignmentsList[") === 0) input.remove();
+        });
+
+        const rawStart = getFieldValue('input[name="MultiPrepareLesson[0].StartDate"]')
+          || getFieldValue('input[name="StartDate"]')
+          || getFieldValue("#StartDate");
+        const startDate = parseResourceDate(rawStart) || new Date();
+        const endDate = new Date(startDate.getTime() + 3 * 24 * 60 * 60 * 1000);
+        const fields = {
+          "LectureAssignmentsList[0].AssignmentId": assignmentId,
+          "LectureAssignmentsList[0].Grade": "1",
+          "LectureAssignmentsList[0].IsGradeBook": attachData && attachData.isGradeBook != null ? String(attachData.isGradeBook) : "true",
+          "LectureAssignmentsList[0].StartTime": attachData && attachData.startDateTime ? String(attachData.startDateTime) : formatResourceDate(startDate),
+          "LectureAssignmentsList[0].EndTime": attachData && attachData.endDateTime ? String(attachData.endDateTime) : formatResourceDate(endDate),
+          "LectureAssignmentsList[0].DayCount": "3"
+        };
+        Object.keys(fields).forEach(function (name) {
+          const input = document.createElement("input");
+          input.type = "hidden";
+          input.name = name;
+          input.value = fields[name];
+          form.appendChild(input);
+        });
+        console.log("[Tahdiri] Injected LectureAssignmentsList into native save form → AssignmentId:", assignmentId);
+        return true;
+      }
+
+      try {
+        const silentAssignmentId = await silentCreateHomeworkResource(unitId, assignmentParentId, assignmentLessonId, getCurrentLessonName(), schoolId);
+        if (silentAssignmentId) {
+          const rawStart = getFieldValue('input[name="MultiPrepareLesson[0].StartDate"]')
+            || getFieldValue('input[name="StartDate"]')
+            || getFieldValue("#StartDate");
+          const attachResult = await silentAttachHomeworkToLecture({
+            assignmentId: silentAssignmentId,
+            subjectId: unitId,
+            schoolId: getNumericSchoolIdValue() || '',
+            timeTableId: getFieldValue('input[name="MultiPrepareLesson[0].TimeTableId"]') || getFieldValue('#TimeTableId'),
+            startDateRaw: rawStart,
+            endDateRaw: getFieldValue('input[name="MultiPrepareLesson[0].EndDate"]') || getFieldValue('input[name="EndDate"]'),
+            isMulti: Boolean(getFieldValue('input[name="MultiPrepareLesson[0].TimeTableId"]')),
+            dayCount: '3',
+            assignmentType: '1',
+            isGradeBook: true
+          });
+          if (!attachResult.ok) {
+            console.warn("[Tahdiri] Assignment fallback: AddAssignmentToLecture did not confirm attach:", attachResult.message);
+          }
+          const attachData = attachResult.data || {};
+          const injected = injectAssignmentIntoCurrentForm(silentAssignmentId, attachData);
+          if (!injected) {
+            return buildResult(false, "Assignment was created but could not be injected into the save form", { assignmentId: silentAssignmentId });
+          }
+          injectHomeworkIntoPageState(silentAssignmentId, attachData, {
+            grade: '1',
+            assignmentName: 'واجب (' + getCurrentLessonName() + ')',
+            assignmentType: '1',
+            dayCount: '3',
+            timeTableId: getFieldValue('input[name="MultiPrepareLesson[0].TimeTableId"]') || getFieldValue('#TimeTableId'),
+            startDateTime: attachData.startDateTime || '',
+            endDateTime: attachData.endDateTime || ''
+          });
+          hasInjectedFallbackResource = true;
+          return buildResult(true, "Assignment created and linked", { assignmentId: silentAssignmentId, attachStatus: attachResult.status });
+        }
+      } catch (silentErr) {
+        console.warn("[Tahdiri] Assignment fallback: silent homework helper failed, trying legacy fallback:", silentErr && silentErr.message);
+      }
+
       const payload = new URLSearchParams();
       payload.append("SaveButton", "");
       payload.append("IdEnc", "");
@@ -3990,9 +4375,12 @@
       }
       await sleep(1200);
       const counts = getLessonResourceCounts();
-      if (counts.hasAny) {
+      if (counts.assignments && counts.assignments >= Math.max(1, beforeCounts.assignments || 0)) {
         hasInjectedFallbackResource = true;
         return buildResult(true, "Assignment created and linked", { counts });
+      }
+      if (counts.hasAny) {
+        return buildResult(false, "Assignment fallback request completed but no assignment was linked", { counts });
       }
       return buildResult(false, "Assignment was created but not linked to the lesson");
     }
@@ -4003,15 +4391,22 @@
         initialCounts.enrichments || initialCounts.assignments || initialCounts.exams || initialCounts.projects
       );
       const hasKnownResource = settings.ignoreInjectedResource ? hasVisibleResource : initialCounts.hasAny;
-      if (hasKnownResource) {
+      if (hasKnownResource && initialCounts.assignments) {
         return buildResult(true, "Lesson already has a resource", { counts: initialCounts });
       }
 
-      // 1. SKIP UI Enrichment completely. Go directly to Silent POST Assignment.
-      // This perfectly mimics the competitor's speed and reliability.
+      // 1. Always try homework first unless the lesson already shows an assignment.
+      // A visible activity/exam satisfies Madrasati validation, but it should not
+      // suppress the homework linkage this extension is expected to add.
       const assignmentResult = await createAssignmentFallback({ force: true });
       if (assignmentResult.ok) {
         return assignmentResult;
+      }
+      if (hasKnownResource) {
+        return buildResult(true, "Lesson already has another resource; assignment fallback failed", {
+          counts: initialCounts,
+          assignmentError: assignmentResult.message
+        });
       }
 
       // 2. Silent POST School Activity Fallback

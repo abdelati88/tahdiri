@@ -11,7 +11,8 @@
  *   3. POST /Teacher/LectureTools/GetAssignmentsList
  *   4. POST /Teacher/LectureTools/GetExamsList
  *   5. POST /Teacher/LectureTools/AddAssignment
- *   6. GET/POST /Teacher/Assignments/Manage
+ *   6. POST /Teacher/LectureTools/AddAssignmentToLecture
+ *   7. GET/POST /Teacher/Assignments/Manage
  *
  * Console helpers after install:
  *   __TAHDIRI_CAPTURE.status()
@@ -22,10 +23,10 @@
 (function tahdiriCaptureInstaller() {
   'use strict';
 
-  var INSTALL_KEY = '__TAHDIRI_CAPTURE_INSTALLED_V3__';
+  var INSTALL_KEY = '__TAHDIRI_CAPTURE_INSTALLED_V4__';
   var API_KEY = '__TAHDIRI_CAPTURE';
-  var XHR_META_KEY = '__TAHDIRI_CAPTURE_XHR_META_V3__';
-  var STORAGE_KEY = 'TAHDIRI_CAPTURE_RESPONSES_V3';
+  var XHR_META_KEY = '__TAHDIRI_CAPTURE_XHR_META_V4__';
+  var STORAGE_KEY = 'TAHDIRI_CAPTURE_RESPONSES_V4';
   var LOG_PREFIX = '[CAPTURE]';
   var PREVIEW_CHARS = 900;
   var REQUEST_BODY_CHARS = 12000;
@@ -63,6 +64,12 @@
     {
       key: 'AddAssignment',
       path: '/Teacher/LectureTools/AddAssignment',
+      expectedMethod: 'POST',
+      extension: 'html'
+    },
+    {
+      key: 'AddAssignmentToLecture',
+      path: '/Teacher/LectureTools/AddAssignmentToLecture',
       expectedMethod: 'POST',
       extension: 'html'
     },
