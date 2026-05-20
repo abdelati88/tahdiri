@@ -1489,6 +1489,72 @@
     async function silentCreateEnrichmentResource(subjectId, chapterId, lessonId, lessonName, realSchoolId) {
       const schoolId = String(realSchoolId).trim();
 
+      // ── Inner helpers: GetActivitiesList DIFF to resolve newly-created enrichment's activity ID ──
+      const _actSnapshot = async function (label) {
+        const snapIds = new Set();
+        try {
+          const body = new URLSearchParams();
+          body.append('activityname', '');
+          body.append('lectureActivitiesList', '');
+          body.append('selectedUnitId', String(subjectId));
+          body.append('treeId', String(lessonId));
+          body.append('lessonsId[]', String(lessonId));
+          body.append('childOfSubject', String(chapterId));
+          body.append('schoolId', schoolId);
+          const res = await fetch('/Teacher/LectureTools/GetActivitiesList', {
+            method: 'POST',
+            credentials: 'same-origin',
+            redirect: 'follow',
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+              'Accept': '*/*',
+              'X-Requested-With': 'XMLHttpRequest'
+            },
+            body: body.toString()
+          });
+          if (res.status >= 200 && res.status < 400) {
+            let htmlInner = await res.text();
+            try { const j = JSON.parse(htmlInner); if (j && typeof j.html === 'string') htmlInner = j.html; } catch (_) {}
+            const pats = [
+              /class=["'][^"']*selectActivity[^"']*["'][^>]*id=["'](\d{6,12})["']/gi,
+              /id=["'](\d{6,12})["'][^>]*class=["'][^"']*selectActivity/gi,
+              /name=["']LectureActivitiesList\[\d+\]\.ActivityId["'][^>]*value=["'](\d{6,12})["']/gi,
+              /value=["'](\d{6,12})["'][^>]*name=["']LectureActivitiesList\[\d+\]\.ActivityId["']/gi,
+              /data-activity-id=["'](\d{6,12})["']/gi,
+              /"ActivityId"\s*:\s*(\d{6,12})/gi,
+              /activityId[=_](\d{6,12})/gi
+            ];
+            for (const re of pats) {
+              let m; re.lastIndex = 0;
+              while ((m = re.exec(htmlInner)) !== null) snapIds.add(String(m[1]));
+            }
+          }
+        } catch (e) {
+          console.warn('[Tahdiri] Enrichment _actSnapshot [' + label + '] threw:', e && e.message);
+        }
+        console.log('[Tahdiri] Enrichment _actSnapshot [' + label + ']:', snapIds.size, 'id(s)');
+        return snapIds;
+      };
+
+      const _pollForNewActivityId = async function (beforeSnap) {
+        const schedule = [1000, 2000, 3000, 3000, 3000];
+        for (let i = 0; i < schedule.length; i++) {
+          await new Promise(function (r) { setTimeout(r, schedule[i]); });
+          const afterSnap = await _actSnapshot('after-probe-' + (i + 1));
+          const newIds = [...afterSnap].filter(function (id) { return !beforeSnap.has(id); });
+          if (newIds.length > 0) {
+            const sorted = newIds.map(function (s) { return BigInt(s); }).sort(function (a, b) { return a > b ? -1 : a < b ? 1 : 0; });
+            const picked = String(sorted[0]);
+            console.log('[Tahdiri] ✅ Enrichment DIFF → new activity ID:', picked,
+              '(after', schedule.slice(0, i + 1).reduce(function (a, b) { return a + b; }, 0), 'ms)');
+            return picked;
+          }
+          console.warn('[Tahdiri] Enrichment DIFF probe', i + 1, '— no new activity ID yet');
+        }
+        console.warn('[Tahdiri] Enrichment DIFF exhausted — activity ID not found (enrichment was created but linking to lecture will be skipped)');
+        return '';
+      };
+
       // 1. Scrape CSRF + HashKey from the MangeResources/Create page
       let token = '';
       let hashKey = '';
@@ -1515,12 +1581,12 @@
         console.log('[Tahdiri] Enrichment Create page scraped → token:', token ? token.slice(0, 20) + '...' : 'EMPTY', '| hashKey:', hashKey ? hashKey.slice(0, 20) + '...' : 'EMPTY');
       } catch (e) {
         console.error('[Tahdiri] Enrichment: failed to fetch Create page', e);
-        return false;
+        return '';
       }
 
       if (!token) {
         console.error('[Tahdiri] Enrichment: no CSRF token found — aborting');
-        return false;
+        return '';
       }
 
       // 2. Fetch goals for SelectedGoles (base64 JSON of [{GoalId, LessonId},...])
@@ -1593,6 +1659,9 @@
       payload.append('hfDrawTree', hfDrawTree);
       payload.append('SchoolId', schoolId);
 
+      // ── Snapshot GetActivitiesList BEFORE creation (DIFF strategy to get new activity ID) ──
+      const _actBeforeIds = await _actSnapshot('before-create');
+
       console.log('[Tahdiri] Enrichment POST payload → Name:', 'إثراء: ' + lessonName, '| hfLevelsCount:1 | golesLen:', selectedGolesB64.length);
       try {
         const saveRes = await fetch('/LearningResources/MangeResources/Create', {
@@ -1610,16 +1679,16 @@
         // "إضافة إثراء" form (validation failure — e.g. empty SelectedGoles or
         // a missing required field). Treating it as success would mask the failure.
         if (saveRes.type === 'opaqueredirect' || saveRes.status === 0) {
-          console.log('[Tahdiri] ✅ Enrichment created successfully (302 redirect)');
-          return true;
+          console.log('[Tahdiri] ✅ Enrichment created successfully (302 redirect) — resolving activity ID via DIFF...');
+          return await _pollForNewActivityId(_actBeforeIds);
         }
         let _bodyLen = 0;
         try { const _t = await saveRes.text(); _bodyLen = _t.length; } catch (_) {}
         console.warn('[Tahdiri] Enrichment: Create returned status', saveRes.status, '(expected 302). Likely form re-render (validation failed). Body length:', _bodyLen);
-        return false;
+        return '';
       } catch (e) {
         console.error('[Tahdiri] Enrichment: POST failed', e);
-        return false;
+        return '';
       }
     }
 
@@ -1762,6 +1831,55 @@
         return { ok: true, data: data || {}, status: res.status, message: '' };
       } catch (e) {
         console.warn('[Tahdiri] AddAssignmentToLecture threw:', e && e.message);
+        return { ok: false, data: null, status: 0, message: e && e.message };
+      }
+    }
+
+    // ── Enrichment (إثراء) lecture linking: POST AddActivityToLecture ──────────────
+    // Called after silentCreateEnrichmentResource resolves the enrichment's activity ID.
+    // Returns { ok, data, status, message } — same shape as silentAttachHomeworkToLecture.
+    async function silentAttachEnrichmentToLecture(options) {
+      const settings = options || {};
+      const activityId = String(settings.activityId || '').trim();
+      if (!activityId) return { ok: false, data: null, status: 0, message: 'missing activityId' };
+
+      const schoolId    = String(settings.schoolId || '').trim();
+      const subjectId   = String(settings.subjectId || '').trim();
+      const timeTableId = String(settings.timeTableId || '').trim();
+      const startDate   = parseMadrasatiResourceDateValue(settings.startDateRaw) || new Date();
+      const endDate     = addDays(startDate, 3);
+
+      const body = new URLSearchParams();
+      body.set('activityId',     activityId);
+      body.set('SchoolId',       schoolId);
+      body.set('selectedUnitId', subjectId);
+      body.set('TimeTableId',    timeTableId);
+      body.set('sDate',          formatGregorianYmd(startDate));
+      body.set('eDate',          formatGregorianYmd(endDate));
+      body.set('DayCount',       '3');
+
+      try {
+        console.log('[Tahdiri] AddActivityToLecture POST → activityId:', activityId, 'SchoolId:', schoolId, 'TimeTableId:', timeTableId);
+        const res = await fetch('/Teacher/LectureTools/AddActivityToLecture', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            'X-Requested-With': 'XMLHttpRequest'
+          },
+          body: body.toString()
+        });
+        const text = await res.text();
+        let data = null;
+        try { data = text ? JSON.parse(text) : null; } catch (_) {}
+        if (!res.ok) {
+          console.warn('[Tahdiri] AddActivityToLecture failed status', res.status, 'body:', text.slice(0, 240));
+          return { ok: false, data: data, status: res.status, message: text.slice(0, 240) };
+        }
+        console.log('[Tahdiri] ✅ AddActivityToLecture accepted → activityId:', activityId, 'response:', data || text.slice(0, 160));
+        return { ok: true, data: data || {}, status: res.status, message: '' };
+      } catch (e) {
+        console.warn('[Tahdiri] AddActivityToLecture threw:', e && e.message);
         return { ok: false, data: null, status: 0, message: e && e.message };
       }
     }
@@ -2602,7 +2720,7 @@
       // Both run independently — neither their result nor their ID is needed until SaveLastLessonPlan.
       // Fail-soft: if either fails it logs a warning but the lesson save continues.
       const _enrichmentPromise = silentCreateEnrichmentResource(treeSubjectId, chapterId, lessonId, lessonName, realSchoolId)
-        .catch(function (e) { console.warn('[Tahdiri] Enrichment creation threw:', e && e.message); return false; });
+        .catch(function (e) { console.warn('[Tahdiri] Enrichment creation threw:', e && e.message); return ''; });
       const _homeworkPromise = silentCreateHomeworkResource(treeSubjectId, chapterId, lessonId, lessonName, realSchoolId)
         .catch(function (e) { console.warn('[Tahdiri] Homework creation threw:', e && e.message); return ''; });
       const _examPromise = silentCreateExamResource(treeSubjectId, chapterId, lessonId, lessonName, realSchoolId)
@@ -2639,10 +2757,10 @@
       }
 
       // Collect Enrichment + Homework + Exam results (all three were running concurrently)
-      const enrichmentCreated    = await _enrichmentPromise;
+      const enrichmentActivityId = await _enrichmentPromise;
       const homeworkAssignmentId = await _homeworkPromise;
       const examId               = await _examPromise;
-      console.log('[Tahdiri] Enrichment created:', enrichmentCreated);
+      console.log('[Tahdiri] Enrichment activity ID:', enrichmentActivityId || '(none — enrichment not linked to lecture)');
       console.log('[Tahdiri] Homework AssignmentId:', homeworkAssignmentId || '(none — will save without assignment)');
       console.log('[Tahdiri] Exam ExamId:', examId || '(none — will save without exam)');
 
@@ -3235,6 +3353,22 @@
           });
         } else {
           console.warn('[Tahdiri] Homework AddAssignmentToLecture attach failed; SaveLastLessonPlan payload will still include AssignmentId:', resolvedAssignmentId, 'reason:', attachResult.message);
+        }
+      }
+
+      // ── Link enrichment (إثراء) to the lecture time slot via AddActivityToLecture ──
+      if (enrichmentActivityId) {
+        const _enrichAttach = await silentAttachEnrichmentToLecture({
+          activityId:   enrichmentActivityId,
+          subjectId:    String(finalSubjectId).trim(),
+          schoolId:     String(finalForm.get('SchoolId') || '').trim(),
+          timeTableId:  String(finalForm.get('TimeTableId') || finalTimeTableId || '').trim(),
+          startDateRaw: rawLectureStart
+        });
+        if (_enrichAttach.ok) {
+          console.log('[Tahdiri] ✅ Enrichment linked to lecture → activityId:', enrichmentActivityId);
+        } else {
+          console.warn('[Tahdiri] Enrichment AddActivityToLecture failed (activityId:', enrichmentActivityId, '):', _enrichAttach.message);
         }
       }
 

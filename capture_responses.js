@@ -15,6 +15,8 @@
  *   7. GET/POST /Teacher/Assignments/Manage
  *   8. POST /LearningResources/MangeResources/GetGoalLessonSubject
  *   9. POST /LearningResources/MangeResources/Create
+ *  10. POST /Teacher/LectureTools/AddActivity
+ *  11. POST /Teacher/LectureTools/AddActivityToLecture
  *
  * Console helpers after install:
  *   __TAHDIRI_CAPTURE.status()
@@ -93,6 +95,18 @@
       path: '/LearningResources/MangeResources/Create',
       expectedMethod: 'POST',
       extension: 'html'
+    },
+    {
+      key: 'AddActivity',
+      path: '/Teacher/LectureTools/AddActivity',
+      expectedMethod: 'POST',
+      extension: 'json'
+    },
+    {
+      key: 'AddActivityToLecture',
+      path: '/Teacher/LectureTools/AddActivityToLecture',
+      expectedMethod: 'POST',
+      extension: 'json'
     }
   ];
 
