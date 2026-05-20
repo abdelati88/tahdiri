@@ -1546,9 +1546,21 @@
             .map(function (row) { return { GoalId: row.GoalId, LessonId: lessonIdNum }; });
           if (goalEntries.length > 0) {
             selectedGolesB64 = btoa(JSON.stringify(goalEntries));
-            console.log('[Tahdiri] Enrichment: SelectedGoles built with', goalEntries.length, 'goal(s)');
+            console.log('[Tahdiri] Enrichment: SelectedGoles built with', goalEntries.length, 'goal(s) for lessonId', lessonId);
           } else {
-            console.warn('[Tahdiri] Enrichment: no goals found for lessonId', lessonId, '— using empty array');
+            // Fallback: use all goals from the subject (different subjects may use different
+            // lesson ID formats; an empty SelectedGoles causes the server to return 200/form-HTML
+            // instead of 302, so we must always send at least one entry).
+            const allGoalEntries = goalsData
+              .filter(function (row) { return row && row.GoalId; })
+              .slice(0, 10)
+              .map(function (row) { return { GoalId: row.GoalId, LessonId: Number(row.LessonId) || lessonIdNum }; });
+            if (allGoalEntries.length > 0) {
+              selectedGolesB64 = btoa(JSON.stringify(allGoalEntries));
+              console.warn('[Tahdiri] Enrichment: lessonId', lessonId, 'not found in goals — using first', allGoalEntries.length, 'subject goal(s) as fallback');
+            } else {
+              console.warn('[Tahdiri] Enrichment: GetGoalLessonSubject returned no goals at all for subjectId', subjectId, '— enrichment Create will likely return 200 (failure)');
+            }
           }
         }
       } catch (e) {
@@ -1593,13 +1605,18 @@
           },
           body: payload.toString()
         });
-        // 302 / opaqueredirect = success (same pattern as Activity)
-        if (saveRes.type === 'opaqueredirect' || saveRes.status === 0 || saveRes.status === 302) {
-          console.log('[Tahdiri] ✅ Enrichment created successfully');
+        // 302 / opaqueredirect = success (same pattern as Activity).
+        // DO NOT return saveRes.ok for a 200: a 200 means the server re-rendered the
+        // "إضافة إثراء" form (validation failure — e.g. empty SelectedGoles or
+        // a missing required field). Treating it as success would mask the failure.
+        if (saveRes.type === 'opaqueredirect' || saveRes.status === 0) {
+          console.log('[Tahdiri] ✅ Enrichment created successfully (302 redirect)');
           return true;
         }
-        console.warn('[Tahdiri] Enrichment: unexpected response status', saveRes.status);
-        return saveRes.ok;
+        let _bodyLen = 0;
+        try { const _t = await saveRes.text(); _bodyLen = _t.length; } catch (_) {}
+        console.warn('[Tahdiri] Enrichment: Create returned status', saveRes.status, '(expected 302). Likely form re-render (validation failed). Body length:', _bodyLen);
+        return false;
       } catch (e) {
         console.error('[Tahdiri] Enrichment: POST failed', e);
         return false;

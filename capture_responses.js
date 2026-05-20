@@ -13,6 +13,8 @@
  *   5. POST /Teacher/LectureTools/AddAssignment
  *   6. POST /Teacher/LectureTools/AddAssignmentToLecture
  *   7. GET/POST /Teacher/Assignments/Manage
+ *   8. POST /LearningResources/MangeResources/GetGoalLessonSubject
+ *   9. POST /LearningResources/MangeResources/Create
  *
  * Console helpers after install:
  *   __TAHDIRI_CAPTURE.status()
@@ -33,7 +35,8 @@
   var NEAR_MISS_PREFIXES = [
     '/teacher/assignments/',
     '/teacher/exams/',
-    '/teacher/lecturetools/'
+    '/teacher/lecturetools/',
+    '/learningresources/'
   ];
 
   var TARGETS = [
@@ -77,6 +80,18 @@
       key: 'AssignmentsManage',
       path: '/Teacher/Assignments/Manage',
       expectedMethod: 'GET/POST',
+      extension: 'html'
+    },
+    {
+      key: 'MangeResourcesGoals',
+      path: '/LearningResources/MangeResources/GetGoalLessonSubject',
+      expectedMethod: 'POST',
+      extension: 'json'
+    },
+    {
+      key: 'MangeResourcesCreate',
+      path: '/LearningResources/MangeResources/Create',
+      expectedMethod: 'POST',
       extension: 'html'
     }
   ];
